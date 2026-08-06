@@ -15,15 +15,14 @@ jobs:
         runs-on: ubuntu-latest
         steps:
             - name: Install toolchain
-              uses: actions-rs/toolchain@v1
+              uses: dtolnay/rust-toolchain@nightly
               with:
-                  toolchain: nightly-2024-10-21
-                  override: true
-            - uses: actions/checkout@v3
+                  components: rustfmt
+            - uses: actions/checkout@v4
               with:
                   submodules: recursive
             - name: Check fmt
-              run: rustup component add rustfmt && cargo fmt --check
+              run: cargo fmt --check
 
     build-radar-web:
         name: Radar Web Scripts
@@ -80,9 +79,7 @@ jobs:
               with:
                   submodules: recursive
             - name: Install toolchain
-              uses: actions-rs/toolchain@v1
-              with:
-                  toolchain: stable
+              uses: dtolnay/rust-toolchain@stable
             - uses: Swatinem/rust-cache@v2
               with:
                   cache-on-failure: true
@@ -159,10 +156,7 @@ jobs:
                   submodules: recursive
 
             - name: Install toolchain
-              uses: actions-rs/toolchain@v1
-              with:
-                  toolchain: nightly
-                  override: true
+              uses: dtolnay/rust-toolchain@nightly
 
             - name: Get package version
               shell: bash
@@ -198,10 +192,7 @@ jobs:
                   submodules: recursive
 
             - name: Install latest nightly
-              uses: actions-rs/toolchain@v1
-              with:
-                  toolchain: nightly
-                  override: true
+              uses: dtolnay/rust-toolchain@nightly
 
             - name: Get package version
               shell: bash
@@ -241,10 +232,7 @@ jobs:
                   submodules: recursive
 
             - name: Install toolchain
-              uses: actions-rs/toolchain@v1
-              with:
-                  toolchain: nightly
-                  override: true
+              uses: dtolnay/rust-toolchain@nightly
 
             - name: Get package version
               shell: bash
