@@ -3,8 +3,9 @@
   <h1>⚡ Valthrun Enhanced CS2</h1>
 
   <p>
-    <b>An actively maintained, high-performance, ultra-smooth fork of Valthrun CS2.</b><br>
-    Engineered for 144Hz, 240Hz, and 360Hz+ high-refresh-rate displays with zero ESP micro-stutter.
+    <b>The smoothest external read-only CS2 overlay ever built.</b><br>
+    Snapshot interpolation, a dedicated memory-reader thread, and a zero-allocation render path.<br>
+    Engineered for 144Hz, 240Hz, and 360Hz+ displays.
   </p>
 
   <p>
@@ -20,38 +21,78 @@
 
 ## 🌟 Overview
 
-**Valthrun Enhanced** is an open-source, read-only external gameplay overlay for Counter-Strike 2. While stock Valthrun provides a great foundation, default builds suffer from **64 Hz memory tick jitter**, **per-frame string search overhead**, and **Win32 lock contention**.
+**Valthrun Enhanced** is an open-source, read-only external gameplay overlay for Counter-Strike 2, forked from the excellent [Valthrun](https://github.com/Valthrun/valthrun-cs2) project.
 
-**Valthrun Enhanced** resolves these bottlenecks, delivering **silky-smooth 240FPS+ rendering** while remaining 100% read-only and non-injected.
+Stock Valthrun reads game memory and renders ESP **on the same thread, at the same moment**. Since CS2 only updates entity positions at **64 Hz**, projecting those raw positions onto a 240Hz+ monitor produces visible stepping and micro-stutter — and every driver read happens *inside* your render frame, so any kernel latency spike becomes a visible hitch.
+
+**Valthrun Enhanced rebuilds the entire data path** to fix this at the architecture level, while remaining 100% read-only and non-injected.
 
 ---
 
-## 🔥 Why Valthrun Enhanced is Better
+## 🆚 Why Valthrun Enhanced is Better
 
-| Feature / Metric | Stock Valthrun | Valthrun Enhanced ⚡ |
+| System | Stock Valthrun | Valthrun Enhanced ⚡ |
 | :--- | :--- | :--- |
-| **ESP Motion Smoothness** | 64 Hz memory tick jitter | **Silky-Smooth 240Hz+ Synchronized Pawn & Bone LERP** |
-| **Entity Lookup Speed** | $O(\log N)$ `BTreeMap` search | **$O(1)$ High-Speed `HashMap` Index Table** |
-| **Head Bone Lookup** | Linear string search (`"head_0"`) every frame | **Pre-cached `head_bone_index` on model load** |
-| **Win32 IPC Contention** | Synchronous `GetClientRect` every frame | **Throttled window tracking (1 in 15 frames)** |
-| **Spectator List UI** | Basic name dump | **Sleek `Spectators ({count})` Header Panel** |
-| **Stealth & Safety** | 100% Read-Only / Non-Injected | **100% Read-Only / Non-Injected (Unchanged)** |
+| **ESP Motion** | Raw 64 Hz positions rendered per frame → visible stepping | **Snapshot Interpolation Engine** — renders *between* game states for mathematically linear motion |
+| **Memory Reads** | Synchronous driver reads inline on the render thread | **Dedicated 300 Hz background reader thread** — the render thread never touches the driver |
+| **Frame Pacing** | Fixed per-frame LERP (behaves differently at 144 vs 240 FPS) | **Time-based interpolation** — frame-rate independent at any refresh rate |
+| **Read→Render Handoff** | Same thread (blocking) | **Lock-free `ArcSwap` double-buffered snapshots** — zero locks, zero copies on the hot path |
+| **Hot Path Allocations** | Deep-clones bone matrices per player per frame | **Recycled buffers** — near-zero allocations while rendering |
+| **Entity Lookup** | $O(\log N)$ `BTreeMap` search | **$O(1)$ `HashMap` index table** |
+| **Head Bone Lookup** | Linear `"head_0"` string search every frame | **Pre-cached `head_bone_index` on model load** |
+| **Win32 IPC** | Synchronous `GetClientRect` every frame | **Throttled window tracking (1 in 15 frames)** |
+| **Observability** | FPS counter | **Frame-time 1% low, reads/s, tick cadence, snapshot age, reader rate — live in the overlay** |
+| **Stealth & Safety** | 100% Read-Only / Non-Injected | **100% Read-Only / Non-Injected (unchanged)** |
 
 ---
 
-## ⚡ Key Optimizations
+## 🧠 The Zero-Lag Architecture
+
+```
+┌─────────────────────┐   fixed-rate poll (up to 500Hz)   ┌──────────────────────┐
+│  Memory Reader      │ ─────────────────────────────────▶│  Lock-free snapshot   │
+│  Thread             │        immutable EspSnapshot      │  swap (ArcSwap)       │
+│  (all driver reads) │                                   │                       │
+└─────────────────────┘                                   └──────────┬───────────┘
+                                                                     │ latest
+                    ┌────────────────────────────────────────────────▼──────────┐
+                    │  Render thread (uncapped, zero driver reads)              │
+                    │  • Per-entity ring buffer of timestamped snapshots        │
+                    │  • Renders at now − adaptive delay, linear interpolation  │
+                    │  • Origin + all 128 bones interpolated in lockstep        │
+                    └───────────────────────────────────────────────────────────┘
+```
 
 > [!TIP]
-> **Synchronized Pawn & Bone LERP**
-> CS2 memory updates entity positions at 64 Hz. Projecting raw 64 Hz positions on a 240 Hz monitor causes ESP boxes to jitter. We implemented a **Synchronized Exponential LERP Filter** for player origins and bone matrices in lockstep—delivering silky-smooth ESP movement with zero bone drift.
+> **Snapshot Interpolation ("Silky" mode — default)**
+> The overlay records timestamped snapshots of every player's origin and bone matrices, then renders slightly in the past, interpolating *between* the two nearest game states. The 64 Hz memory staircase becomes perfectly linear motion. The delay **auto-tunes itself** to the measured game tick cadence (typically ~20ms), so there is nothing to configure.
 
 > [!NOTE]
-> **$O(1)$ Entity Resolution & Model Caching**
-> Handle lookups use an $O(1)$ hash map, and `head_bone_index` is cached upon model loading—eliminating per-frame string matching across 128 model bones.
+> **"Zero-Delay" mode**
+> Prefer zero added latency over perfect linearity? Switch the smoothing mode and the engine extrapolates from the newest snapshot using real velocity — clamped so it can never visibly overshoot.
 
 > [!IMPORTANT]
-> **Win32 Lock Contention Fix**
-> Window tracking queries (`GetClientRect`, `ClientToScreen`) are throttled to run once every 15 frames, eliminating graphics render thread stalls.
+> **Why the reader thread matters**
+> Every driver read is a kernel transition. On stock Valthrun, those happen *inside* your render frame — any spike is a visible hitch. In Valthrun Enhanced, the render thread only performs an atomic pointer swap. Driver latency can no longer stall a single rendered frame.
+
+> [!CAUTION]
+> **Teleport & respawn safety**
+> A >100-unit single-tick jump flushes an entity's interpolation history instantly — no smearing across the map on respawns, teleports, or entity-ID recycling. Smoothing can also be disabled entirely in settings, restoring stock behavior.
+
+---
+
+## 🎛️ Smoothing Settings (ESP → Smoothing)
+
+| Setting | Default | What it does |
+| :--- | :--- | :--- |
+| **Enable ESP smoothing** | `On` | Master switch. Off = raw stock behavior. |
+| **Mode** | `Silky` | `Silky` interpolates (smoothest). `Zero-Delay` extrapolates (lowest latency). |
+| **Adaptive delay** | `On` | Matches render delay to the measured game tick rate automatically. |
+| **Interpolation delay** | `10ms` | Manual delay when adaptive is off. |
+| **Max extrapolation** | `24ms` | Cap on velocity projection into the future. |
+| **Reader poll rate** | `300 Hz` | Background thread read rate. Anything above ~128 Hz is freshness headroom (the game ticks at 64 Hz) — lower it if you want fewer reads/s. |
+
+Live diagnostics are shown directly below the settings: **tick cadence, effective delay, tracked players, snapshot age, and reader rate** — plus a **frame-time 1% low** readout in the watermark, so smoothness is measured, not guessed.
 
 ---
 
@@ -66,11 +107,25 @@ Download the official Valthrun Loader required to map the read-only kernel drive
 
 ### Step 3: Launch Sequence
 1. Start **Counter-Strike 2**.
-2. Go to CS2 **Settings -> Video -> Display Mode** and set it to **"Fullscreen Windowed"** (or **Borderless Windowed**).
+2. Go to CS2 **Settings → Video → Display Mode** and set it to **"Fullscreen Windowed"** (or **Borderless Windowed**).
 3. Open the **Valthrun Loader** and map the read-only memory driver.
 4. Place your compiled `controller.exe` inside the **Valthrun Loader directory**.
 5. Launch `controller.exe`.
 6. Press the **`PAUSE`** key on your keyboard to toggle the interactive overlay settings menu!
+
+---
+
+## ✨ Feature Set
+
+- **Player ESP** — 2D/3D boxes, skeleton with per-bone interpolation, health bars, head dot, tracers, off-screen arrows
+- **Player info** — name, weapon, ammo, HP, distance, grenades, flags (kit / bomb carrier / scoped / flashed)
+- **Bomb tools** — detonation timer with defuse tracking, world-space bomb label (planted + dropped)
+- **Triggerbot** — randomized delay window, team check, post-delay target retest
+- **Recoil helper** — simple aim-punch compensation
+- **Spectator list** — see who's watching you, in a clean header panel
+- **Grenade helper** — per-map lineup spots with position & angle guidance
+- **Sniper crosshair** — overlay dot while holding a sniper rifle
+- **Stream-proof overlay** — hidden from screen capture (optional)
 
 ---
 
@@ -96,13 +151,14 @@ The compiled binary will be generated at `target/release/controller.exe`.
 
 ## 🛡️ Stealth & Anti-Cheat Safety
 
-- **100% Read-Only**: Zero writes to CS2 process memory.
+- **100% Read-Only**: Zero writes to CS2 process memory. The interpolation engine and reader thread only ever *read*.
 - **Zero Memory Injection**: No DLLs are injected into `cs2.exe`.
 - **Standalone DirectX Overlay**: Rendered via an independent, transparent DirectX 11 window overlay (`DwmExtendFrameIntoClientArea`).
+- **Optional screen-capture exclusion**: `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`.
 
 ---
 
 ## 📜 License & Credits
 
-- Original Valthrun project by [Valthrun Team](https://github.com/Valthrun/valthrun-cs2).
+- Original Valthrun project by the [Valthrun Team](https://github.com/Valthrun/valthrun-cs2).
 - **Valthrun Enhanced** maintained by [iarhaaan](https://github.com/iarhaaan/valthrun-enhanced).

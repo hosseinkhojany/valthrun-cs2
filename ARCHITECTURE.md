@@ -46,7 +46,9 @@ Use this matrix to instantly find where to edit code when fixing or implementing
 
 | Feature / System | Key Source File(s) | Description |
 | :--- | :--- | :--- |
-| **Player ESP (2D/3D Box, Skeleton)** | `controller/src/enhancements/player/mod.rs` | Renders player skeletons, bounding boxes, health bars, head indicators |
+| **Player ESP (2D/3D Box, Skeleton)** | `controller/src/enhancements/player/mod.rs` | Renders player skeletons, bounding boxes, health bars, head indicators. Consumes reader-thread snapshots and applies interpolation |
+| **ESP Memory Reader Thread** | `controller/src/memory_thread.rs` | Background thread polling game memory at a fixed rate, publishing lock-free `EspSnapshot`s via `ArcSwap` |
+| **Snapshot Interpolation Engine** | `controller/src/view/interp.rs` | `InterpBuffer`: timestamped ring buffer with linear interpolation & clamped velocity extrapolation (Silky / Zero-Delay modes) |
 | **Player Info Text (Name, Health, Weapon)** | `controller/src/enhancements/player/info_layout.rs` | Layout math for player labels (weapon name, health text, distance) |
 | **Bomb Overlay & Defuse Timer** | `controller/src/enhancements/bomb.rs` | Detonation countdown, site location, defuse timer visuals |
 | **Triggerbot Logic** | `controller/src/enhancements/trigger.rs` | Crosshair target raycasting, bone hit checks, mouse click actuation |
@@ -55,7 +57,8 @@ Use this matrix to instantly find where to edit code when fixing or implementing
 | **Sniper Crosshair** | `controller/src/enhancements/sniper_crosshair.rs` | Overlay crosshair while scoped or wielding sniper rifles |
 | **Aim Assistant** | `controller/src/enhancements/aim.rs` | Aim target tracking logic |
 | **3D to 2D Screen Projection** | `controller/src/view/world.rs` | `world_to_screen` coordinate translation using view matrix |
-| **Settings Menu UI (Egui)** | `controller/src/settings/ui.rs` | Interactive options overlay (Pause key menu layout) |
+| **Settings Menu UI (ImGui)** | `controller/src/settings/ui.rs` | Interactive options overlay (Pause key menu layout) |
+| **ESP Smoothing Configuration** | `controller/src/settings/esp.rs` | `EspSmoothingSettings`: mode, adaptive delay, extrapolation cap, reader poll rate |
 | **ESP Configuration & Colors** | `controller/src/settings/esp.rs` | ESP toggles, colors, line widths, visibility settings struct |
 | **App Configuration Storage** | `controller/src/settings/config.rs` | Save/load user settings to/from config files |
 | **App Main & Memory Backend Init** | `controller/src/main.rs` | Memory provider initialization (Win32/KVM/PCILeech), main loop |
@@ -82,9 +85,10 @@ Use this matrix to instantly find where to edit code when fixing or implementing
 ## 3. Crate Breakdown & Detail
 
 ### 3.1 `controller` (Enhancements, Menu UI, Main Loop)
-- **`src/main.rs`**: Main binary entry point. Coordinates memory reader provider (Win32 API fallback, KVM, PCILeech DMA, Kernel IOCTL driver), initializes overlay, polls hotkeys, runs game ticks.
+- **`src/main.rs`**: Main binary entry point. Coordinates memory reader provider (Win32 API fallback, KVM, PCILeech DMA, Kernel IOCTL driver), initializes overlay, polls hotkeys, runs game ticks. Spawns the ESP memory reader thread.
+- **`src/memory_thread.rs`**: `EspReader` — background thread with its own `CS2Handle`/`StateRegistry` that polls player game state at a fixed rate and publishes immutable `EspSnapshot`s through a lock-free `ArcSwap` double buffer. Keeps driver latency off the render thread.
 - **`src/enhancements/`**: Contains all visual overlays & gameplay assistance logic.
-  - `player/mod.rs` & `player/info_layout.rs`: All ESP visual features.
+  - `player/mod.rs` & `player/info_layout.rs`: All ESP visual features. Player data is consumed from `EspSnapshot` and smoothed via per-entity `InterpBuffer`s.
   - `bomb.rs`: Bomb site, C4 detonation timer, defuse progress.
   - `trigger.rs`: Crosshair triggerbot.
   - `spectators_list.rs`: Observer target list.
@@ -93,7 +97,8 @@ Use this matrix to instantly find where to edit code when fixing or implementing
   - `ui.rs`: The Egui menu rendered when pressing `PAUSE`.
   - `esp.rs`, `config.rs`, `hotkey.rs`: Settings models & persistence.
 - **`src/view/`**:
-  - `world.rs`: World-to-screen matrix transforms.
+  - `world.rs`: World-to-screen matrix transforms (scalar projection).
+  - `interp.rs`: Snapshot interpolation engine (`InterpBuffer`, `EspSmoothingStats`).
 
 ### 3.2 `cs2` (CS2 Memory Reading & Schema Engine)
 - **`src/handle.rs`**: Core process memory reader interface (`ProcessHandle`).
