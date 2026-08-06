@@ -62,6 +62,7 @@ pub struct Bone {
 pub struct CS2Model {
     pub name: String,
     pub bones: Vec<Bone>,
+    pub head_bone_index: Option<usize>,
 
     pub vhull_min: nalgebra::Vector3<f32>,
     pub vhull_max: nalgebra::Vector3<f32>,
@@ -142,6 +143,7 @@ impl CS2Model {
                 flags,
             });
         }
+        self.head_bone_index = self.bones.iter().position(|bone| bone.name == "head_0");
         Ok(())
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use anyhow::anyhow;
 use cs2_schema_cutl::EntityHandle;
@@ -27,7 +27,7 @@ type OuterEntityList = [Ptr64<InnerEntityList>; 64];
 #[derive(Clone)]
 pub struct StateEntityList {
     entities: Vec<Copy<dyn CEntityIdentity>>,
-    handle_lookup: BTreeMap<u32, usize>,
+    handle_lookup: HashMap<u32, usize>,
 }
 
 impl State for StateEntityList {

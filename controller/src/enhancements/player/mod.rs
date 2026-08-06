@@ -44,6 +44,8 @@ pub struct PlayerESP {
     toggle: KeyToggle,
     players: Vec<PlayerESPInfo>,
     local_team_id: u8,
+    smoothed_positions: std::collections::HashMap<u32, nalgebra::Vector3<f32>>,
+    smoothed_bone_positions: std::collections::HashMap<u32, Vec<nalgebra::Vector3<f32>>>,
 }
 
 impl PlayerESP {
@@ -52,6 +54,8 @@ impl PlayerESP {
             toggle: KeyToggle::new(),
             players: Default::default(),
             local_team_id: 0,
+            smoothed_positions: Default::default(),
+            smoothed_bone_positions: Default::default(),
         }
     }
 
@@ -198,13 +202,52 @@ impl Enhancement for PlayerESP {
                 continue;
             }
 
-            let pawn_model = ctx
+            let pawn_model_ref = ctx
                 .states
                 .resolve::<StatePawnModelInfo>(entity_identity.handle()?)?;
 
+            let mut pawn_info = pawn_info.clone();
+            let prev_pos = self
+                .smoothed_positions
+                .get(&pawn_info.pawn_entity_id)
+                .copied()
+                .unwrap_or(pawn_info.position);
+
+            let delta = pawn_info.position - prev_pos;
+            let smoothed_pos = if delta.norm_squared() > 400.0 {
+                pawn_info.position
+            } else {
+                prev_pos + delta * 0.40
+            };
+
+            self.smoothed_positions
+                .insert(pawn_info.pawn_entity_id, smoothed_pos);
+            pawn_info.position = smoothed_pos;
+
+            let mut pawn_model = pawn_model_ref.clone();
+            let entity_id = pawn_info.pawn_entity_id;
+            let prev_bones = self.smoothed_bone_positions.entry(entity_id).or_insert_with(|| {
+                pawn_model.bone_states.iter().map(|b| b.position).collect()
+            });
+
+            if prev_bones.len() == pawn_model.bone_states.len() {
+                for (i, bone) in pawn_model.bone_states.iter_mut().enumerate() {
+                    let bone_delta = bone.position - prev_bones[i];
+                    let smoothed_bone_pos = if bone_delta.norm_squared() > 400.0 {
+                        bone.position
+                    } else {
+                        prev_bones[i] + bone_delta * 0.40
+                    };
+                    prev_bones[i] = smoothed_bone_pos;
+                    bone.position = smoothed_bone_pos;
+                }
+            } else {
+                *prev_bones = pawn_model.bone_states.iter().map(|b| b.position).collect();
+            }
+
             self.players.push(PlayerESPInfo {
-                pawn_info: pawn_info.clone(),
-                pawn_model: pawn_model.clone(),
+                pawn_info,
+                pawn_model,
             });
         }
 
@@ -292,11 +335,7 @@ impl Enhancement for PlayerESP {
             }
 
             if esp_settings.head_dot != EspHeadDot::None {
-                if let Some(head_bone_index) = entry_model
-                    .bones
-                    .iter()
-                    .position(|bone| bone.name == "head_0")
-                {
+                if let Some(head_bone_index) = entry_model.head_bone_index {
                     if let Some(head_state) = pawn_model.bone_states.get(head_bone_index) {
                         if let (Some(head_position), Some(head_far)) = (
                             view.world_to_screen(

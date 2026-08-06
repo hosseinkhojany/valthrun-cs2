@@ -40,14 +40,23 @@ impl Enhancement for SpectatorsListIndicator {
         };
         let spectators = states.resolve::<SpectatorList>(target_entity_id)?;
 
+        let spectator_count = spectators.spectators.len();
+        if spectator_count == 0 {
+            return Ok(());
+        }
+
         let group = ui.begin_group();
 
-        let line_count = spectators.spectators.iter().count();
+        let line_count = spectator_count + 1;
         let text_height = ui.text_line_height_with_spacing() * line_count as f32;
 
         let offset_x = ui.io().display_size[0] * 0.01;
         let offset_y = (ui.io().display_size[1] - text_height) * 0.5;
         let mut offset_y = offset_y;
+
+        ui.set_cursor_pos([offset_x, offset_y]);
+        ui.unicode_text_with_shadow(unicode_text, &format!("Spectators ({}):", spectator_count));
+        offset_y += ui.text_line_height_with_spacing();
 
         for spectator in &spectators.spectators {
             ui.set_cursor_pos([offset_x, offset_y]);
