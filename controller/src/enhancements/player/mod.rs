@@ -226,9 +226,10 @@ impl Enhancement for PlayerESP {
 
             let mut pawn_model = pawn_model_ref.clone();
             let entity_id = pawn_info.pawn_entity_id;
-            let prev_bones = self.smoothed_bone_positions.entry(entity_id).or_insert_with(|| {
-                pawn_model.bone_states.iter().map(|b| b.position).collect()
-            });
+            let prev_bones = self
+                .smoothed_bone_positions
+                .entry(entity_id)
+                .or_insert_with(|| pawn_model.bone_states.iter().map(|b| b.position).collect());
 
             if prev_bones.len() == pawn_model.bone_states.len() {
                 for (i, bone) in pawn_model.bone_states.iter_mut().enumerate() {
