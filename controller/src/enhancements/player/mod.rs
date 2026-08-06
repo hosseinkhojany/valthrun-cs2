@@ -1,15 +1,12 @@
+use std::time::{
+    Duration,
+    Instant,
+};
+
 use cs2::{
     BoneFlags,
-    CEntityIdentityEx,
     CS2Model,
-    ClassNameCache,
-    LocalCameraControllerTarget,
-    PlayerPawnState,
-    StateCS2Memory,
-    StateEntityList,
-    StateLocalPlayerController,
     StatePawnInfo,
-    StatePawnModelInfo,
 };
 use info_layout::PlayerInfoLayout;
 use obfstr::obfstr;
@@ -17,6 +14,7 @@ use overlay::UnicodeTextRenderer;
 
 use super::Enhancement;
 use crate::{
+    memory_thread::EspReader,
     settings::{
         AppSettings,
         EspBoxType,
@@ -25,38 +23,76 @@ use crate::{
         EspHealthBar,
         EspPlayerSettings,
         EspSelector,
+        EspSmoothingMode,
         EspTracePosition,
     },
     view::{
+        InterpBuffer,
         KeyToggle,
+        StateEspSmoothingStats,
         ViewController,
     },
 };
 
 mod info_layout;
 
+/// Amount of timestamped snapshots kept per entity
+const INTERP_BUFFER_CAPACITY: usize = 8;
+
+/// Squared distance (game units²) travelled within a single update which
+/// is considered a teleport/respawn and flushes the interpolation history.
+const TELEPORT_THRESHOLD_SQ: f32 = 100.0 * 100.0;
+
 struct PlayerESPInfo {
     pawn_info: StatePawnInfo,
-    pawn_model: StatePawnModelInfo,
+    model_address: u64,
+    bone_positions: Vec<nalgebra::Vector3<f32>>,
 }
 
 pub struct PlayerESP {
     toggle: KeyToggle,
+    reader: EspReader,
     players: Vec<PlayerESPInfo>,
     local_team_id: u8,
-    smoothed_positions: std::collections::HashMap<u32, nalgebra::Vector3<f32>>,
-    smoothed_bone_positions: std::collections::HashMap<u32, Vec<nalgebra::Vector3<f32>>>,
+
+    origin_buffers: std::collections::HashMap<u32, InterpBuffer<nalgebra::Vector3<f32>>>,
+    bone_buffers: std::collections::HashMap<u32, InterpBuffer<Vec<nalgebra::Vector3<f32>>>>,
+    seen_entities: Vec<u32>,
+
+    last_sample_change: Option<Instant>,
+    sample_cadence: f32,
 }
 
 impl PlayerESP {
-    pub fn new() -> Self {
+    pub fn new(reader: EspReader) -> Self {
         PlayerESP {
             toggle: KeyToggle::new(),
+            reader,
             players: Default::default(),
             local_team_id: 0,
-            smoothed_positions: Default::default(),
-            smoothed_bone_positions: Default::default(),
+            origin_buffers: Default::default(),
+            bone_buffers: Default::default(),
+            seen_entities: Default::default(),
+            last_sample_change: None,
+            /* initial guess: CS2 updates entity positions at 64Hz */
+            sample_cadence: 1.0 / 64.0,
         }
+    }
+
+    /// Track the cadence of actual game state changes (exponential moving average).
+    fn track_sample_cadence(
+        last_sample_change: &mut Option<Instant>,
+        sample_cadence: &mut f32,
+        now: Instant,
+    ) {
+        if let Some(last) = *last_sample_change {
+            let interval = now.duration_since(last).as_secs_f32();
+            /* ignore sub-millisecond bursts (multiple entities updated within the same tick) */
+            if interval > 0.0005 && interval < 0.5 {
+                *sample_cadence = *sample_cadence * 0.9 + interval * 0.1;
+            }
+        }
+        *last_sample_change = Some(now);
     }
 
     fn resolve_esp_player_config<'a>(
@@ -133,8 +169,6 @@ impl PlayerESP {
 
 impl Enhancement for PlayerESP {
     fn update(&mut self, ctx: &crate::UpdateContext) -> anyhow::Result<()> {
-        let entities = ctx.states.resolve::<StateEntityList>(())?;
-        let class_name_cache = ctx.states.resolve::<ClassNameCache>(())?;
         let settings = ctx.states.resolve::<AppSettings>(())?;
         if self
             .toggle
@@ -149,116 +183,137 @@ impl Enhancement for PlayerESP {
             );
         }
 
-        self.players.clear();
+        self.reader.set_enabled(self.toggle.enabled);
+        self.reader
+            .set_poll_rate_hz(settings.esp_smoothing.reader_poll_rate_hz);
+
+        self.seen_entities.clear();
         if !self.toggle.enabled {
+            self.players.clear();
+            self.origin_buffers.clear();
+            self.bone_buffers.clear();
             return Ok(());
         }
 
+        /* recycle the previous frame's entries to reuse their allocations */
+        let mut previous_players = std::mem::take(&mut self.players);
         self.players.reserve(16);
 
-        let memory = ctx.states.resolve::<StateCS2Memory>(())?;
-        let local_player_controller = ctx.states.resolve::<StateLocalPlayerController>(())?;
-        let Some(local_player_controller) = local_player_controller
-            .instance
-            .value_reference(memory.view_arc())
-        else {
-            return Ok(());
-        };
-
-        self.local_team_id = local_player_controller.m_iPendingTeamNum()?;
-
-        let view_target = ctx.states.resolve::<LocalCameraControllerTarget>(())?;
-        let view_target_entity_id = match &view_target.target_entity_id {
-            Some(value) => *value,
-            None => return Ok(()),
-        };
-
-        for entity_identity in entities.entities() {
-            if entity_identity.handle::<()>()?.get_entity_index() == view_target_entity_id {
-                continue;
-            }
-
-            let entity_class = class_name_cache.lookup(&entity_identity.entity_class_info()?)?;
-            if !entity_class
-                .map(|name| *name == "C_CSPlayerPawn")
-                .unwrap_or(false)
-            {
-                /* entity is not a player pawn */
-                continue;
-            }
-
-            let pawn_state = ctx
-                .states
-                .resolve::<PlayerPawnState>(entity_identity.handle()?)?;
-            if *pawn_state != PlayerPawnState::Alive {
-                continue;
-            }
-
-            let pawn_info = ctx
-                .states
-                .resolve::<StatePawnInfo>(entity_identity.handle()?)?;
-
-            if pawn_info.player_health <= 0 || pawn_info.player_name.is_none() {
-                continue;
-            }
-
-            let pawn_model_ref = ctx
-                .states
-                .resolve::<StatePawnModelInfo>(entity_identity.handle()?)?;
-
-            let mut pawn_info = pawn_info.clone();
-            let prev_pos = self
-                .smoothed_positions
-                .get(&pawn_info.pawn_entity_id)
-                .copied()
-                .unwrap_or(pawn_info.position);
-
-            let delta = pawn_info.position - prev_pos;
-            let dist_sq = delta.norm_squared();
-            let lerp_factor = if dist_sq > 400.0 {
-                1.0
-            } else if dist_sq > 25.0 {
-                0.65
-            } else {
-                0.40
-            };
-
-            let smoothed_pos = prev_pos + delta * lerp_factor;
-
-            self.smoothed_positions
-                .insert(pawn_info.pawn_entity_id, smoothed_pos);
-            pawn_info.position = smoothed_pos;
-
-            let mut pawn_model = pawn_model_ref.clone();
-            let entity_id = pawn_info.pawn_entity_id;
-            let prev_bones = self
-                .smoothed_bone_positions
-                .entry(entity_id)
-                .or_insert_with(|| pawn_model.bone_states.iter().map(|b| b.position).collect());
-
-            if prev_bones.len() == pawn_model.bone_states.len() {
-                for (i, bone) in pawn_model.bone_states.iter_mut().enumerate() {
-                    let bone_delta = bone.position - prev_bones[i];
-                    let bone_dist_sq = bone_delta.norm_squared();
-                    let bone_lerp = if bone_dist_sq > 400.0 {
-                        1.0
-                    } else if bone_dist_sq > 25.0 {
-                        0.65
-                    } else {
-                        0.40
-                    };
-                    let smoothed_bone_pos = prev_bones[i] + bone_delta * bone_lerp;
-                    prev_bones[i] = smoothed_bone_pos;
-                    bone.position = smoothed_bone_pos;
+        let smoothing = settings.esp_smoothing;
+        let effective_delay = match smoothing.mode {
+            EspSmoothingMode::Silky => {
+                if smoothing.adaptive_delay {
+                    (self.sample_cadence * 1.25).clamp(0.005, 0.025)
+                } else {
+                    (smoothing.interp_delay_ms / 1000.0).clamp(0.0, 0.05)
                 }
-            } else {
-                *prev_bones = pawn_model.bone_states.iter().map(|b| b.position).collect();
+            }
+            EspSmoothingMode::ZeroDelay => 0.0,
+        };
+        let max_extrapolate = Duration::from_secs_f32(smoothing.max_extrapolate_ms / 1000.0);
+        let now = Instant::now();
+        let render_time = now
+            .checked_sub(Duration::from_secs_f32(effective_delay))
+            .unwrap_or(now);
+
+        /*
+         * The latest game state snapshot produced by the background
+         * memory reader thread. No driver reads happen on this thread.
+         */
+        let snapshot = self.reader.latest();
+        self.local_team_id = snapshot.local_team_id;
+        let captured_at = snapshot.captured_at.unwrap_or(now);
+
+        for player in snapshot.players.iter() {
+            let entity_id = player.info.pawn_entity_id;
+            self.seen_entities.push(entity_id);
+
+            let mut entry = match previous_players
+                .iter()
+                .position(|entry| entry.pawn_info.pawn_entity_id == entity_id)
+            {
+                Some(index) => previous_players.swap_remove(index),
+                None => PlayerESPInfo {
+                    pawn_info: player.info.clone(),
+                    model_address: 0,
+                    bone_positions: Vec::new(),
+                },
+            };
+            entry.pawn_info = player.info.clone();
+            entry.model_address = player.model_address;
+            entry.bone_positions.clear();
+            entry
+                .bone_positions
+                .extend_from_slice(&player.bone_positions);
+
+            if smoothing.enabled {
+                /* flush the interpolation history on teleports / respawns */
+                let teleported = self
+                    .origin_buffers
+                    .get(&entity_id)
+                    .and_then(|buffer| buffer.latest_value())
+                    .map(|latest| {
+                        (entry.pawn_info.position - latest).norm_squared() > TELEPORT_THRESHOLD_SQ
+                    })
+                    .unwrap_or(false);
+                if teleported {
+                    if let Some(buffer) = self.origin_buffers.get_mut(&entity_id) {
+                        buffer.clear();
+                    }
+                    if let Some(buffer) = self.bone_buffers.get_mut(&entity_id) {
+                        buffer.clear();
+                    }
+                }
+
+                {
+                    let origin_buffer = self
+                        .origin_buffers
+                        .entry(entity_id)
+                        .or_insert_with(|| InterpBuffer::new(INTERP_BUFFER_CAPACITY));
+
+                    if origin_buffer.push_changed(captured_at, entry.pawn_info.position) {
+                        Self::track_sample_cadence(
+                            &mut self.last_sample_change,
+                            &mut self.sample_cadence,
+                            captured_at,
+                        );
+                    }
+                    if let Some(position) = origin_buffer.sample(render_time, max_extrapolate) {
+                        entry.pawn_info.position = position;
+                    }
+                }
+
+                {
+                    let bone_buffer = self
+                        .bone_buffers
+                        .entry(entity_id)
+                        .or_insert_with(|| InterpBuffer::new(INTERP_BUFFER_CAPACITY));
+
+                    bone_buffer.push_bones_changed(captured_at, &entry.bone_positions);
+                    bone_buffer.sample_into(
+                        render_time,
+                        max_extrapolate,
+                        &mut entry.bone_positions,
+                    );
+                }
             }
 
-            self.players.push(PlayerESPInfo {
-                pawn_info,
-                pawn_model,
-            });
+            self.players.push(entry);
+        }
+
+        if smoothing.enabled {
+            let seen_entities = &self.seen_entities;
+            self.origin_buffers
+                .retain(|entity_id, _| seen_entities.contains(entity_id));
+            self.bone_buffers
+                .retain(|entity_id, _| seen_entities.contains(entity_id));
+
+            if let Ok(mut stats) = ctx.states.resolve_mut::<StateEspSmoothingStats>(()) {
+                stats.sample_cadence = self.sample_cadence;
+                stats.effective_delay = effective_delay;
+                stats.tracked_entities = self.origin_buffers.len();
+                stats.snapshot_age = now.duration_since(captured_at).as_secs_f32();
+            }
         }
 
         Ok(())
@@ -285,7 +340,8 @@ impl Enhancement for PlayerESP {
         for entry in self.players.iter() {
             let PlayerESPInfo {
                 pawn_info,
-                pawn_model,
+                model_address,
+                bone_positions,
             } = entry;
 
             let distance = (pawn_info.position - view_world_position).norm() * UNITS_TO_METERS;
@@ -301,16 +357,16 @@ impl Enhancement for PlayerESP {
 
             let player_rel_health = (pawn_info.player_health as f32 / 100.0).clamp(0.0, 1.0);
 
-            let entry_model = states.resolve::<CS2Model>(pawn_model.model_address)?;
+            let entry_model = states.resolve::<CS2Model>(*model_address)?;
             let player_2d_box = view.calculate_box_2d(
                 &(entry_model.vhull_min + pawn_info.position),
                 &(entry_model.vhull_max + pawn_info.position),
             );
 
             if esp_settings.skeleton {
-                let bones = entry_model.bones.iter().zip(pawn_model.bone_states.iter());
+                let bones = entry_model.bones.iter().zip(bone_positions.iter());
 
-                for (bone, state) in bones {
+                for (bone, position) in bones {
                     if (bone.flags & BoneFlags::FlagHitbox as u32) == 0 {
                         continue;
                     }
@@ -321,13 +377,12 @@ impl Enhancement for PlayerESP {
                         continue;
                     };
 
-                    let parent_position = match view
-                        .world_to_screen(&pawn_model.bone_states[parent_index].position, true)
-                    {
-                        Some(position) => position,
-                        None => continue,
-                    };
-                    let bone_position = match view.world_to_screen(&state.position, true) {
+                    let parent_position =
+                        match view.world_to_screen(&bone_positions[parent_index], true) {
+                            Some(position) => position,
+                            None => continue,
+                        };
+                    let bone_position = match view.world_to_screen(position, true) {
                         Some(position) => position,
                         None => continue,
                     };
@@ -346,15 +401,15 @@ impl Enhancement for PlayerESP {
 
             if esp_settings.head_dot != EspHeadDot::None {
                 if let Some(head_bone_index) = entry_model.head_bone_index {
-                    if let Some(head_state) = pawn_model.bone_states.get(head_bone_index) {
+                    if let Some(head_state_position) = bone_positions.get(head_bone_index) {
                         if let (Some(head_position), Some(head_far)) = (
                             view.world_to_screen(
-                                &(head_state.position
+                                &(head_state_position
                                     + nalgebra::Vector3::new(0.0, 0.0, esp_settings.head_dot_z)),
                                 true,
                             ),
                             view.world_to_screen(
-                                &(head_state.position
+                                &(head_state_position
                                     + nalgebra::Vector3::new(
                                         0.0,
                                         0.0,
@@ -686,15 +741,10 @@ impl Enhancement for PlayerESP {
             // Draw offscreen indicators for players not visible on screen
             if esp_settings.offscreen_arrows {
                 // Use head position for more accurate direction, fallback to body position
-                let target_position = if let Some(head_bone_index) = entry_model
-                    .bones
-                    .iter()
-                    .position(|bone| bone.name == "head_0")
-                {
-                    pawn_model
-                        .bone_states
+                let target_position = if let Some(head_bone_index) = entry_model.head_bone_index {
+                    bone_positions
                         .get(head_bone_index)
-                        .map(|head_state| head_state.position)
+                        .copied()
                         .unwrap_or(pawn_info.position)
                 } else {
                     // If no head bone, use top of the player hull

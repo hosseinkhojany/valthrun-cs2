@@ -32,6 +32,7 @@ use super::{
     EspConfig,
     EspPlayerSettings,
     EspSelector,
+    EspSmoothingSettings,
     HotKey,
 };
 
@@ -225,6 +226,9 @@ pub struct AppSettings {
 
     #[serde(default = "default_esp_configs_enabled")]
     pub esp_settings_enabled: BTreeMap<String, bool>,
+
+    #[serde(default)]
+    pub esp_smoothing: EspSmoothingSettings,
 
     #[serde(default = "bool_true")]
     pub bomb_timer: bool,

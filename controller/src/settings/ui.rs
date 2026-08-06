@@ -53,18 +53,21 @@ use super::{
 };
 use crate::{
     enhancements::StateGrenadeHelperPlayerLocation,
+    memory_thread::StateEspReaderStats,
     settings::{
         AppSettings,
         EspBoxType,
         EspHeadDot,
         EspHealthBar,
         EspPlayerSettings,
+        EspSmoothingMode,
         EspTracePosition,
     },
     utils::{
         ImGuiKey,
         ImguiComboEnum,
     },
+    view::StateEspSmoothingStats,
     Application,
 };
 
@@ -281,6 +284,7 @@ impl SettingsUI {
                             ui.text(obfstr!("ESP has been disabled."));
                             ui.text(obfstr!("Please enable ESP under \"Visuals\" > \"ESP\""));
                         } else {
+                            self.render_esp_smoothing(&app.app_state, &mut *settings, ui);
                             self.render_esp_settings(&mut *settings, ui);
                         }
                     }
@@ -1044,6 +1048,77 @@ impl SettingsUI {
         _target: EspSelector,
     ) {
         ui.text("Weapon!");
+    }
+
+    fn render_esp_smoothing(
+        &mut self,
+        states: &StateRegistry,
+        settings: &mut AppSettings,
+        ui: &imgui::Ui,
+    ) {
+        if !ui.collapsing_header(
+            obfstr!("Smoothing##esp_smoothing"),
+            TreeNodeFlags::DEFAULT_OPEN,
+        ) {
+            return;
+        }
+
+        let smoothing = &mut settings.esp_smoothing;
+        ui.checkbox(obfstr!("Enable ESP smoothing"), &mut smoothing.enabled);
+
+        let _enabled = ui.begin_enabled(smoothing.enabled);
+        ui.set_next_item_width(220.0);
+        ui.combo_enum(
+            obfstr!("Mode##smoothing"),
+            &[
+                (EspSmoothingMode::Silky, "Silky (interpolated)"),
+                (EspSmoothingMode::ZeroDelay, "Zero-Delay (extrapolated)"),
+            ],
+            &mut smoothing.mode,
+        );
+
+        ui.checkbox(
+            obfstr!("Adaptive delay (match game tick rate)"),
+            &mut smoothing.adaptive_delay,
+        );
+
+        {
+            let _manual = ui.begin_enabled(!smoothing.adaptive_delay);
+            ui.set_next_item_width(150.0);
+            ui.slider_config(obfstr!("Interpolation delay"), 0.0, 30.0)
+                .display_format("%.1f ms")
+                .build(&mut smoothing.interp_delay_ms);
+        }
+
+        ui.set_next_item_width(150.0);
+        ui.slider_config(obfstr!("Max extrapolation"), 0.0, 50.0)
+            .display_format("%.1f ms")
+            .build(&mut smoothing.max_extrapolate_ms);
+
+        ui.set_next_item_width(150.0);
+        ui.slider_config(obfstr!("Reader poll rate"), 64.0, 500.0)
+            .display_format("%.0f Hz")
+            .build(&mut smoothing.reader_poll_rate_hz);
+
+        if let Ok(stats) = states.resolve::<StateEspSmoothingStats>(()) {
+            ui.text(format!(
+                "Tick cadence: {:.1}ms | Effective delay: {:.1}ms | Tracked players: {}",
+                stats.sample_cadence * 1000.0,
+                stats.effective_delay * 1000.0,
+                stats.tracked_entities
+            ));
+            ui.text(format!(
+                "Snapshot age: {:.1}ms",
+                stats.snapshot_age * 1000.0
+            ));
+        }
+
+        if let Ok(reader_stats) = states.resolve::<StateEspReaderStats>(()) {
+            let reader_stats = reader_stats.load();
+            ui.text(format!("Reader thread: {:.0} Hz", reader_stats.poll_rate));
+        }
+
+        ui.separator();
     }
 
     fn render_esp_settings(&mut self, settings: &mut AppSettings, ui: &imgui::Ui) {

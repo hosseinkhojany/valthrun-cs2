@@ -4,6 +4,7 @@ use std::{
         RefCell,
         RefMut,
     },
+    collections::VecDeque,
     error::Error,
     fmt::Debug,
     path::PathBuf,
@@ -66,7 +67,11 @@ use settings::{
 use tokio::runtime;
 use utils::show_critical_error;
 use utils_state::StateRegistry;
-use view::ViewController;
+use view::{
+    EspSmoothingStats,
+    StateEspSmoothingStats,
+    ViewController,
+};
 use windows::Win32::UI::Shell::IsUserAnAdmin;
 
 use crate::{
@@ -79,6 +84,10 @@ use crate::{
         SpectatorsListIndicator,
         TriggerBot,
     },
+    memory_thread::{
+        EspReader,
+        StateEspReaderStats,
+    },
     settings::{
         save_app_settings,
         HotKey,
@@ -89,6 +98,7 @@ use crate::{
 
 mod dialog;
 mod enhancements;
+mod memory_thread;
 mod settings;
 mod utils;
 mod view;
@@ -159,6 +169,14 @@ pub struct Application {
 
     pub frame_read_calls: usize,
     pub last_total_read_calls: usize,
+
+    /// Rolling window (timestamp, calls) of driver read calls,
+    /// used to display a stable reads/second rate.
+    /// Reads are shared with the background memory reader thread.
+    pub read_call_history: VecDeque<(Instant, usize)>,
+
+    /// Rolling window of recent frame times (in seconds) for jitter metrics
+    pub frame_times: VecDeque<f32>,
 
     pub settings_visible: bool,
     pub settings_key_warning_visible: RefCell<bool>,
@@ -275,10 +293,25 @@ impl Application {
         self.frame_read_calls = read_calls - self.last_total_read_calls;
         self.last_total_read_calls = read_calls;
 
+        self.read_call_history
+            .push_back((Instant::now(), self.frame_read_calls));
+        while let Some(front) = self.read_call_history.front() {
+            if front.0.elapsed() > Duration::from_secs(1) {
+                self.read_call_history.pop_front();
+            } else {
+                break;
+            }
+        }
+
         Ok(())
     }
 
-    pub fn render(&self, ui: &imgui::Ui, unicode_text: &UnicodeTextRenderer) {
+    pub fn render(&mut self, ui: &imgui::Ui, unicode_text: &UnicodeTextRenderer) {
+        self.frame_times.push_back(ui.io().delta_time);
+        while self.frame_times.len() > 600 {
+            self.frame_times.pop_front();
+        }
+
         ui.window("overlay")
             .draw_background(false)
             .no_decoration()
@@ -350,6 +383,26 @@ impl Application {
             });
     }
 
+    /// Average and worst 1% frame time of the recent frame history.
+    fn frame_jitter_text(&self) -> String {
+        if self.frame_times.is_empty() {
+            return String::new();
+        }
+
+        let mut sorted: Vec<f32> = self.frame_times.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let average = sorted.iter().sum::<f32>() / sorted.len() as f32;
+        let p99_index = ((sorted.len() as f32 * 0.99) as usize).min(sorted.len() - 1);
+        let worst_1_percent = sorted[p99_index];
+
+        format!(
+            "Frame {:.2}ms | 1% low {:.2}ms",
+            average * 1000.0,
+            worst_1_percent * 1000.0
+        )
+    }
+
     fn render_overlay(&self, ui: &imgui::Ui, unicode_text: &UnicodeTextRenderer) {
         let settings = self.settings();
 
@@ -373,10 +426,20 @@ impl Application {
                 ui.text_with_shadow(&text)
             }
             {
-                let text = format!("{} Reads", self.frame_read_calls);
+                let text = self.frame_jitter_text();
                 ui.set_cursor_pos([
                     ui.window_size()[0] - ui.calc_text_size(&text)[0] - 10.0,
                     38.0,
+                ]);
+                ui.text_with_shadow(&text)
+            }
+            {
+                let reads_per_second: usize =
+                    self.read_call_history.iter().map(|entry| entry.1).sum();
+                let text = format!("{} Reads/s", reads_per_second);
+                ui.set_cursor_pos([
+                    ui.window_size()[0] - ui.calc_text_size(&text)[0] - 10.0,
+                    52.0,
                 ]);
                 ui.text_with_shadow(&text)
             }
@@ -498,6 +561,10 @@ fn real_main(args: &AppArgs) -> anyhow::Result<()> {
     let app_state = StateRegistry::new(1024 * 8);
     app_state.set(StateCS2Handle::new(cs2.clone()), ())?;
     app_state.set(StateCS2Memory::new(cs2.create_memory_view()), ())?;
+    app_state.set(
+        StateEspSmoothingStats::new(EspSmoothingStats::default()),
+        (),
+    )?;
     app_state.set(settings, ())?;
 
     {
@@ -560,6 +627,18 @@ fn real_main(args: &AppArgs) -> anyhow::Result<()> {
         })),
     };
 
+    /*
+     * Spawn the background memory reader for the player ESP.
+     * All driver reads required for the ESP run on that thread,
+     * keeping the render thread free of driver latency spikes.
+     */
+    let esp_reader = {
+        let settings = app_state.resolve::<AppSettings>(())?;
+        EspReader::start(cs2.clone(), settings.esp_smoothing.reader_poll_rate_hz)
+            .context("failed to spawn ESP memory reader thread")?
+    };
+    app_state.set(StateEspReaderStats::new(esp_reader.stats()), ())?;
+
     let mut overlay = match overlay::init(overlay_options) {
         Err(OverlayError::Vulkan(VulkanError::DllNotFound(LoadingError::LibraryLoadFailure(
             source,
@@ -598,7 +677,7 @@ fn real_main(args: &AppArgs) -> anyhow::Result<()> {
 
         enhancements: vec![
             Rc::new(RefCell::new(AntiAimPunsh::new(cvar_sensitivity))),
-            Rc::new(RefCell::new(PlayerESP::new())),
+            Rc::new(RefCell::new(PlayerESP::new(esp_reader))),
             Rc::new(RefCell::new(SpectatorsListIndicator::new())),
             Rc::new(RefCell::new(BombInfoIndicator::new())),
             Rc::new(RefCell::new(BombLabelIndicator::new())),
@@ -609,6 +688,8 @@ fn real_main(args: &AppArgs) -> anyhow::Result<()> {
 
         last_total_read_calls: 0,
         frame_read_calls: 0,
+        read_call_history: VecDeque::with_capacity(600),
+        frame_times: VecDeque::with_capacity(600),
 
         settings_visible: false,
         settings_key_warning_visible: RefCell::new(false),
