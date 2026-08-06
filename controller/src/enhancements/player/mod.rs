@@ -214,11 +214,16 @@ impl Enhancement for PlayerESP {
                 .unwrap_or(pawn_info.position);
 
             let delta = pawn_info.position - prev_pos;
-            let smoothed_pos = if delta.norm_squared() > 400.0 {
-                pawn_info.position
+            let dist_sq = delta.norm_squared();
+            let lerp_factor = if dist_sq > 400.0 {
+                1.0
+            } else if dist_sq > 25.0 {
+                0.65
             } else {
-                prev_pos + delta * 0.40
+                0.40
             };
+
+            let smoothed_pos = prev_pos + delta * lerp_factor;
 
             self.smoothed_positions
                 .insert(pawn_info.pawn_entity_id, smoothed_pos);
@@ -234,11 +239,15 @@ impl Enhancement for PlayerESP {
             if prev_bones.len() == pawn_model.bone_states.len() {
                 for (i, bone) in pawn_model.bone_states.iter_mut().enumerate() {
                     let bone_delta = bone.position - prev_bones[i];
-                    let smoothed_bone_pos = if bone_delta.norm_squared() > 400.0 {
-                        bone.position
+                    let bone_dist_sq = bone_delta.norm_squared();
+                    let bone_lerp = if bone_dist_sq > 400.0 {
+                        1.0
+                    } else if bone_dist_sq > 25.0 {
+                        0.65
                     } else {
-                        prev_bones[i] + bone_delta * 0.40
+                        0.40
                     };
+                    let smoothed_bone_pos = prev_bones[i] + bone_delta * bone_lerp;
                     prev_bones[i] = smoothed_bone_pos;
                     bone.position = smoothed_bone_pos;
                 }

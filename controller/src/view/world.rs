@@ -71,34 +71,34 @@ impl ViewController {
     }
 
     /// Returning an mint::Vector2<f32> as the result should be used via ImGui.
+    #[inline(always)]
     pub fn world_to_screen(
         &self,
         vec: &nalgebra::Vector3<f32>,
         allow_of_screen: bool,
     ) -> Option<mint::Vector2<f32>> {
-        let screen_coords =
-            nalgebra::Vector4::new(vec.x, vec.y, vec.z, 1.0).transpose() * self.view_matrix;
+        let m = &self.view_matrix;
+        let w = vec.x * m.m14 + vec.y * m.m24 + vec.z * m.m34 + m.m44;
 
-        if screen_coords.w < 0.1 {
+        if w < 0.1 {
             return None;
         }
 
-        if !allow_of_screen
-            && (screen_coords.x < -screen_coords.w
-                || screen_coords.x > screen_coords.w
-                || screen_coords.y < -screen_coords.w
-                || screen_coords.y > screen_coords.w)
-        {
+        let x = vec.x * m.m11 + vec.y * m.m21 + vec.z * m.m31 + m.m41;
+        let y = vec.x * m.m12 + vec.y * m.m22 + vec.z * m.m32 + m.m42;
+
+        if !allow_of_screen && (x < -w || x > w || y < -w || y > w) {
             return None;
         }
 
-        let mut screen_pos = mint::Vector2::from_slice(&[
-            screen_coords.x / screen_coords.w,
-            screen_coords.y / screen_coords.w,
-        ]);
-        screen_pos.x = (screen_pos.x + 1.0) * self.screen_bounds.x / 2.0;
-        screen_pos.y = (-screen_pos.y + 1.0) * self.screen_bounds.y / 2.0;
-        Some(screen_pos)
+        let inv_w = 1.0 / w;
+        let screen_x = (1.0 + x * inv_w) * self.screen_bounds.x * 0.5;
+        let screen_y = (1.0 - y * inv_w) * self.screen_bounds.y * 0.5;
+
+        Some(mint::Vector2 {
+            x: screen_x,
+            y: screen_y,
+        })
     }
 
     pub fn calculate_box_2d(
