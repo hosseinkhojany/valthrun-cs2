@@ -117,7 +117,7 @@ jobs:
               uses: docker/metadata-action@v5
               with:
                   images: |
-                      ghcr.io/valthrun/cs2-radar-server
+                      ghcr.io/${{ github.repository }}
                   tags: |
                       type=ref,event=branch
                       type=sha
