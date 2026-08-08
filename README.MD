@@ -195,6 +195,16 @@ cargo +nightly build --release -p controller
 
 The binary lands at `target/release/controller.exe`.
 
+### One-Click Build (Windows)
+
+Prefer to skip the manual setup? **`build_controller.bat`** (in the repository root) automates everything:
+
+- **Checks** all prerequisites (Git, MSVC Build Tools, Rust stable, Rust nightly) and **installs only what's missing** — via `winget`, falling back to the official installers.
+- **Compiles** the release `controller.exe` (`cargo +nightly build --release -p controller`).
+- **Copies** the binary from `target\release\` into the repository root.
+
+If everything is already installed, it skips straight to the build. Every command is commented in the file.
+
 > [!TIP]
 > The release profile builds with **LTO** and `panic = "abort"` for maximum performance. Build scripts and proc-macros are compiled in release mode even for dev builds, so iteration stays fast.
 

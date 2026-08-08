@@ -1,4 +1,5 @@
 **/target/
+controller.exe
 _*
 !/docs/*
 .vscode
