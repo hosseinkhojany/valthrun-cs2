@@ -449,6 +449,55 @@ impl Default for EspWeaponSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub enum EspSmoothingMode {
+    /// Render slightly in the past and interpolate between the last
+    /// observed game states. Perfectly smooth, ~10ms visual delay.
+    Silky,
+
+    /// Render the latest known state and extrapolate via velocity.
+    /// Zero added latency, may micro-overshoot on sharp turns.
+    ZeroDelay,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(default)]
+pub struct EspSmoothingSettings {
+    /// Master switch for the smoothing system.
+    /// When disabled, raw memory positions are rendered (stock behavior).
+    pub enabled: bool,
+
+    pub mode: EspSmoothingMode,
+
+    /// Automatically match the render delay to the measured
+    /// game state update cadence (recommended).
+    pub adaptive_delay: bool,
+
+    /// Manual render delay (in milliseconds) when `adaptive_delay` is off.
+    pub interp_delay_ms: f32,
+
+    /// Maximum time (in milliseconds) a position may be projected
+    /// into the future when no newer game state is available yet.
+    pub max_extrapolate_ms: f32,
+
+    /// How often (per second) the background memory thread
+    /// polls the game state.
+    pub reader_poll_rate_hz: f32,
+}
+
+impl Default for EspSmoothingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: EspSmoothingMode::Silky,
+            adaptive_delay: true,
+            interp_delay_ms: 10.0,
+            max_extrapolate_ms: 24.0,
+            reader_poll_rate_hz: 300.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, PartialOrd)]
 #[serde(tag = "type")]
 pub enum EspConfig {

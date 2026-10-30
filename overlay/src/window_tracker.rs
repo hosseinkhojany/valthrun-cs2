@@ -119,6 +119,7 @@ pub struct WindowTracker {
     overlay_hwnd: HWND,
     target_hwnd: HWND,
     current_bounds: RECT,
+    frame_count: u32,
 }
 
 impl WindowTracker {
@@ -132,14 +133,21 @@ impl WindowTracker {
             overlay_hwnd,
             target_hwnd,
             current_bounds: Default::default(),
+            frame_count: 0,
         })
     }
 
     pub fn mark_force_update(&mut self) {
         self.current_bounds = Default::default();
+        self.frame_count = 0;
     }
 
     pub fn update(&mut self) -> bool {
+        self.frame_count = self.frame_count.wrapping_add(1);
+        if self.frame_count % 15 != 0 && self.current_bounds != RECT::default() {
+            return true;
+        }
+
         let mut rect: RECT = Default::default();
         let success = unsafe { GetClientRect(self.target_hwnd, &mut rect) };
         if !success.as_bool() {

@@ -1,3 +1,6 @@
+mod interp;
+pub use interp::*;
+
 mod world;
 pub use world::*;
 

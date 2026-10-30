@@ -29,6 +29,7 @@ impl TextWithShadowDrawList for DrawListMut<'_> {
     }
 }
 
+#[allow(dead_code)]
 pub trait TextWithShadowUi {
     fn text_with_shadow(&self, text: &str);
     fn text_colored_with_shadow(&self, color: impl Into<ImColor32>, text: &str);
@@ -108,6 +109,7 @@ impl UnicodeTextWithShadowUi for imgui::Ui {
     }
 }
 
+#[allow(dead_code)]
 pub trait ImguiUiEx {
     fn set_cursor_pos_x(&self, pos: f32);
 
@@ -125,6 +127,7 @@ impl ImguiUiEx for imgui::Ui {
     }
 }
 
+#[allow(dead_code)]
 pub trait ImGuiKey {
     fn button_key(&self, label: &str, key: &mut HotKey, size: [f32; 2]) -> bool;
     fn button_key_optional(&self, label: &str, key: &mut Option<HotKey>, size: [f32; 2]) -> bool;
