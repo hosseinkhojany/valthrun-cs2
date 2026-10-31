@@ -26,10 +26,10 @@ pub struct SharedMemoryWriter {
 impl SharedMemoryWriter {
     pub fn new() -> Self {
         // Paylaşılan belleği oluştur veya varsa bağlan
-        let shmem = match ShmemConf::new().size(4096).os_id("yeageth_weapon_data").create() {
+        let shmem = match ShmemConf::new().size(4096).os_id("valthrun_weapon_data").create() {
             Ok(m) => m,
             Err(_) => {
-                ShmemConf::new().os_id("yeageth_weapon_data").open().expect("Failed to open shared memory after creation failed")
+                ShmemConf::new().os_id("valthrun_weapon_data").open().expect("Failed to open shared memory after creation failed")
             }
         };
 

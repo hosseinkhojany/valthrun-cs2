@@ -37,7 +37,6 @@ use cs2::{
     StateBuildInfo,
     StateCS2Handle,
     StateCS2Memory,
-    StateEntityList, // Bunu ekledik, entity listesi state'i için gerekebilir
 };
 use enhancements::{
     Enhancement,
@@ -48,7 +47,6 @@ use imgui::{
     FontConfig,
     FontId,
     FontSource,
-    Key,
     Ui,
 };
 use obfstr::obfstr;
@@ -62,6 +60,8 @@ use overlay::{
     VulkanError,
 };
 use settings::{
+    load_app_settings,
+    save_app_settings,
     AppSettings,
     SettingsUI,
 };
@@ -96,14 +96,9 @@ use crate::{
         EspReader,
         StateEspReaderStats,
     },
-    settings::{
-        save_app_settings,
-        HotKey,
-    },
     utils::TextWithShadowUi,
 
     winver::version_info,
-    network::ws_client,
     network::radar_client::{self, RadarCommand, RadarSessionInfo},
     enhancements::radar_generator::CS2RadarGenerator,
 };
@@ -119,9 +114,6 @@ mod view;
 mod winver;
 
 use std::sync::mpsc;
-use std::thread;
-use std::time::Duration as StdDuration;
-use serde_yaml;
 
 pub trait MetricsClient {
     fn add_metrics_record(&self, record_type: &str, record_payload: &str);
@@ -234,8 +226,10 @@ impl Application {
             let mut imgui_settings = String::new();
             controller.imgui.save_ini_settings(&mut imgui_settings);
             settings.imgui = Some(imgui_settings);
-            
-            log::debug!("Settings updated in memory. Local saving is disabled.");
+
+            if let Err(error) = save_app_settings(&*settings) {
+                log::warn!("Failed to save user settings: {}", error);
+            };
         }
 
         if self
@@ -271,7 +265,7 @@ impl Application {
             }
         }
 
-        if ui.is_key_pressed_no_repeat(self.settings().key_settings.0) {
+        if ui.is_key_pressed_no_repeat(self.settings().key_settings.0) || ui.is_key_pressed_no_repeat(imgui::Key::Home) {
             log::debug!("Toggle settings");
             self.settings_visible = !self.settings_visible;
             self.cs2.add_metrics_record(
@@ -467,7 +461,7 @@ fn main() {
 }
 
 #[derive(Debug, Parser)]
-#[clap(name = "Yeageth", version)]
+#[clap(name = "Valthrun", version)]
 struct AppArgs {
     /// Enable verbose logging ($env:RUST_LOG="trace")
     #[clap(short, long)]
@@ -483,7 +477,7 @@ fn real_main(args: &AppArgs) -> anyhow::Result<()> {
     let build_info = version_info()?;
     log::info!(
         "{} v{} ({}). Windows build {}.",
-        obfstr!("Yeageth"),
+        obfstr!("Valthrun"),
         env!("CARGO_PKG_VERSION"),
         env!("GIT_HASH"),
         build_info.dwBuildNumber
@@ -499,8 +493,7 @@ fn real_main(args: &AppArgs) -> anyhow::Result<()> {
         log::warn!("{}", obfstr!("Running the controller as administrator might cause failures with your graphic drivers."));
     }
 
-    log::info!("Initializing with default settings. Remote settings will be fetched in the background.");
-    let settings: AppSettings = serde_yaml::from_str("").context("Failed to create default settings")?;
+    let settings = load_app_settings()?;
 
     let cs2 = match CS2Handle::create(settings.metrics) {
         Ok(handle) => handle,
@@ -532,7 +525,7 @@ fn real_main(args: &AppArgs) -> anyhow::Result<()> {
             ]
             .join("\n");
 
-            let result = dialog::show_yes_no(obfstr!("Yeageth"), &message, false);
+            let result = dialog::show_yes_no(obfstr!("Valthrun"), &message, false);
             if !result {
                 log::info!("{}", obfstr!("Aborting launch due to user input."));
                 return Ok(());
@@ -706,29 +699,11 @@ fn real_main(args: &AppArgs) -> anyhow::Result<()> {
 
     // --- Remote Settings Fetcher (Değiştirilmeden korundu) ---
     // Removed legacy settings fetcher
-    // let settings_url = "https://yeageth.com/links/getyaml.php".to_string();
-    let (settings_tx, settings_rx) = mpsc::channel::<AppSettings>();
+    let (_settings_tx, settings_rx) = mpsc::channel::<AppSettings>();
 
     // let bg_url = settings_url.clone(); deleted
     // let bg_tx = settings_tx.clone(); handled below
     // let bg_username_state = username_state.clone(); deleted
-
-    // --- WebSocket Client ---
-    let (ws_cmd_tx, ws_cmd_rx) = tokio::sync::mpsc::channel(32);
-    let auth_status = Arc::new(Mutex::new(None));
-
-    // Configure UI with WS context
-    {
-        let mapp = app.borrow();
-        let mut settings_ui = mapp.settings_ui.borrow_mut();
-        settings_ui.set_ws_context(ws_cmd_tx.clone(), auth_status.clone());
-    }
-
-    let bg_tx = settings_tx.clone();
-    let bg_auth_status = auth_status.clone();
-
-    tokio::spawn(ws_client::run_ws_client(ws_cmd_rx, bg_tx, bg_auth_status));
-
 
 
     cs2.add_metrics_record(

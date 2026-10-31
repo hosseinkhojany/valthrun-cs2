@@ -2,14 +2,22 @@
 use std::{
     collections::{
         BTreeMap,
+        BTreeSet,
         HashMap,
     },
+    fs::File,
+    io::{
+        BufReader,
+        BufWriter,
+    },
+    path::PathBuf,
     sync::atomic::{
         AtomicUsize,
         Ordering,
     },
 };
 
+use anyhow::Context;
 use imgui::Key;
 use serde::{
     Deserialize,
@@ -21,7 +29,6 @@ use utils_state::{
     StateCacheType,
 };
 
-use serde_json;
 
 use super::{
     Color,
@@ -43,6 +50,9 @@ fn default_aim_smooth() -> f32 {
 }
 fn default_curve_intensity() -> f32 {
     0.4
+}
+fn default_aim_target() -> AimTarget {
+    AimTarget::Head
 }
 
 fn bool_true() -> bool {
@@ -85,6 +95,25 @@ fn default_trigger_bot_mode() -> KeyToggleMode {
     KeyToggleMode::Trigger
 }
 
+/// Numpad 1 through 9. Index 0 is numpad 1.
+pub const TRIGGER_SHOT_PRESET_COUNT: usize = 9;
+
+pub const TRIGGER_SHOT_PRESET_KEYS: [Key; TRIGGER_SHOT_PRESET_COUNT] = [
+    Key::Keypad1,
+    Key::Keypad2,
+    Key::Keypad3,
+    Key::Keypad4,
+    Key::Keypad5,
+    Key::Keypad6,
+    Key::Keypad7,
+    Key::Keypad8,
+    Key::Keypad9,
+];
+
+fn default_trigger_shot_presets() -> [u32; TRIGGER_SHOT_PRESET_COUNT] {
+    [100, 200, 300, 400, 500, 600, 700, 800, 900]
+}
+
 fn default_esp_configs() -> BTreeMap<String, EspConfig> {
     let mut result: BTreeMap<String, EspConfig> = Default::default();
     result.insert(
@@ -114,6 +143,39 @@ pub enum KeyToggleMode {
     Trigger,
     TriggerInverted,
     Off,
+}
+
+/// Body bone the aimbot pulls the crosshair toward.
+///
+/// Names match the CS2 player skeleton (`head_0`, `neck_0`, `spine_2`, `spine_1`).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum AimTarget {
+    Head,
+    Neck,
+    Chest,
+    MiddleBody,
+}
+
+impl AimTarget {
+    /// Preferred bone first, then the nearest bone in the same region.
+    pub fn bone_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Head => &["head_0"],
+            Self::Neck => &["neck_0"],
+            Self::Chest => &["spine_2", "spine_3"],
+            Self::MiddleBody => &["spine_1", "spine_0"],
+        }
+    }
+
+    /// Fraction of the player hull height above the feet when the skeleton bone is not live.
+    pub fn body_height_factor(self) -> f32 {
+        match self {
+            Self::Head => 0.90,
+            Self::Neck => 0.80,
+            Self::Chest => 0.65,
+            Self::MiddleBody => 0.45,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, PartialOrd)]
@@ -289,6 +351,14 @@ pub struct AppSettings {
     #[serde(default = "default_u32::<400>")]
     pub trigger_bot_shot_duration: u32,
 
+    /// Durations bound to numpad 1-9. Index 0 is numpad 1.
+    #[serde(default = "default_trigger_shot_presets")]
+    pub trigger_bot_shot_presets: [u32; TRIGGER_SHOT_PRESET_COUNT],
+
+    /// Active numpad preset. Empty until a numpad key selects one.
+    #[serde(default)]
+    pub trigger_bot_shot_preset: Option<u8>,
+
     #[serde(default = "bool_false")]
     pub trigger_bot_check_target_after_delay: bool,
 
@@ -335,6 +405,9 @@ pub struct AppSettings {
     #[serde(default = "bool_false")]
     pub aim_bot_draw_fov: bool,
 
+    #[serde(default = "bool_true")]
+    pub aim_bot_draw_pointer: bool,
+
     #[serde(default = "default_key_aimbot")]
     pub aim_bot_key: Option<HotKey>,
 
@@ -346,6 +419,21 @@ pub struct AppSettings {
 
     #[serde(default = "default_curve_intensity")]
     pub aim_bot_curve: f32,
+
+    #[serde(default = "default_aim_target")]
+    pub aim_bot_target: AimTarget,
+
+    /// Player names excluded from ESP.
+    #[serde(default)]
+    pub esp_disabled_players: BTreeSet<String>,
+
+    /// Player names excluded from aimbot and trigger bot.
+    #[serde(default)]
+    pub aim_disabled_players: BTreeSet<String>,
+
+    /// Old combined filter. Folded into both sets on load, then dropped from the file.
+    #[serde(default, rename = "disabled_players", skip_serializing)]
+    legacy_disabled_players: BTreeSet<String>,
 
     // hitmarker
     #[serde(default = "bool_false")]
@@ -365,10 +453,114 @@ pub struct AppSettings {
     pub collect_data_time: u32,
 }
 
+impl AppSettings {
+    /// Copies a numpad preset into the live shoot duration.
+    pub fn select_trigger_shot_preset(&mut self, index: usize) -> bool {
+        let Some(duration) = self.trigger_bot_shot_presets.get(index).copied() else {
+            return false;
+        };
+
+        let next = Some(index as u8);
+        let changed =
+            self.trigger_bot_shot_preset != next || self.trigger_bot_shot_duration != duration;
+        self.trigger_bot_shot_preset = next;
+        self.trigger_bot_shot_duration = duration;
+        changed
+    }
+
+    /// ESP runs for this player only when true.
+    pub fn player_esp_enabled(&self, player_name: Option<&str>) -> bool {
+        Self::name_allowed(&self.esp_disabled_players, player_name)
+    }
+
+    /// Aimbot and trigger bot run for this player only when true.
+    pub fn player_aim_enabled(&self, player_name: Option<&str>) -> bool {
+        Self::name_allowed(&self.aim_disabled_players, player_name)
+    }
+
+    fn name_allowed(disabled: &BTreeSet<String>, player_name: Option<&str>) -> bool {
+        match player_name {
+            Some(name) if !name.is_empty() => !disabled.contains(name),
+            _ => true,
+        }
+    }
+}
+
+fn migrate_legacy_player_filters(settings: &mut AppSettings) {
+    if settings.legacy_disabled_players.is_empty() {
+        return;
+    }
+
+    let legacy = std::mem::take(&mut settings.legacy_disabled_players);
+    for name in legacy {
+        settings.esp_disabled_players.insert(name.clone());
+        settings.aim_disabled_players.insert(name);
+    }
+}
+
 impl State for AppSettings {
     type Parameter = ();
 
     fn cache_type() -> StateCacheType {
         StateCacheType::Persistent
     }
+}
+
+pub fn get_settings_path() -> anyhow::Result<PathBuf> {
+    let exe_file = std::env::current_exe().context("missing current exe path")?;
+    let base_dir = exe_file.parent().context("could not get exe directory")?;
+
+    Ok(base_dir.join("config.yaml"))
+}
+
+pub fn load_app_settings() -> anyhow::Result<AppSettings> {
+    let config_path = get_settings_path()?;
+    if !config_path.is_file() {
+        log::info!(
+            "App config file {} does not exist.",
+            config_path.to_string_lossy()
+        );
+        log::info!("Using default config.");
+        let mut config: AppSettings =
+            serde_yaml::from_str("").context("failed to parse empty config")?;
+        migrate_legacy_player_filters(&mut config);
+
+        return Ok(config);
+    }
+
+    let config = File::open(&config_path).with_context(|| {
+        format!(
+            "failed to open app config at {}",
+            config_path.to_string_lossy()
+        )
+    })?;
+    let mut config = BufReader::new(config);
+
+    let mut config: AppSettings =
+        serde_yaml::from_reader(&mut config).context("failed to parse app config")?;
+    migrate_legacy_player_filters(&mut config);
+
+    log::info!("Loaded app config from {}", config_path.to_string_lossy());
+    Ok(config)
+}
+
+pub fn save_app_settings(settings: &AppSettings) -> anyhow::Result<()> {
+    let config_path = get_settings_path()?;
+    let config = File::options()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&config_path)
+        .with_context(|| {
+            format!(
+                "failed to open app config at {}",
+                config_path.to_string_lossy()
+            )
+        })?;
+    let mut config = BufWriter::new(config);
+
+    serde_yaml::to_writer(&mut config, settings).context("failed to serialize config")?;
+
+    log::debug!("Saved app config.");
+    Ok(())
 }

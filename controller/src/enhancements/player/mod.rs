@@ -344,6 +344,10 @@ impl Enhancement for PlayerESP {
                 bone_positions,
             } = entry;
 
+            if !settings.player_esp_enabled(pawn_info.player_name.as_deref()) {
+                continue;
+            }
+
             let distance = (pawn_info.position - view_world_position).norm() * UNITS_TO_METERS;
             let esp_settings = match self.resolve_esp_player_config(&settings, pawn_info) {
                 Some(settings) => settings,

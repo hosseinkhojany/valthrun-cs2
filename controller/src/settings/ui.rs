@@ -1,8 +1,8 @@
-use std::error::Error as StdError;
 use std::{
     borrow::Cow,
     collections::{
         btree_map::Entry,
+        BTreeSet,
         HashMap,
     },
     fs::File,
@@ -21,14 +21,18 @@ use std::{
 };
 
 use anyhow::Context;
-use chrono::{
-    Datelike,
-    Utc};
 
 // use chrono_tz::Tz; removed
 use cs2::{
+    CEntityIdentityEx,
+    ClassNameCache,
+    PlayerPawnState,
     StateBuildInfo,
+    StateCS2Memory,
     StateCurrentMap,
+    StateEntityList,
+    StateLocalPlayerController,
+    StatePawnInfo,
 };
 use imgui::{
     Condition,
@@ -45,12 +49,10 @@ use obfstr::obfstr;
 use overlay::UnicodeTextRenderer;
 
 // use reqwest::blocking::Client; removed
-use serde::Deserialize;
 use utils_state::StateRegistry;
-use tokio::sync::mpsc::Sender;
-use crate::network::ws_client::WsCommand;
 
 use super::{
+    AimTarget,
     Color,
     EspColor,
     EspColorType,
@@ -73,6 +75,7 @@ use crate::{
         EspPlayerSettings,
         EspSmoothingMode,
         EspTracePosition,
+        TRIGGER_SHOT_PRESET_COUNT,
     },
     utils::{
         ImGuiKey,
@@ -99,29 +102,6 @@ enum GrenadeSettingsTarget {
 
 
 
-// Add these with your other enums
-enum UiState {
-    Login,
-    LoggedIn,
-}
-
-// Login işleminin durumunu yönetir
-enum LoginStatus {
-    Idle,
-    InProgress,
-    Failed(String),
-}
-
-// Login ekranı için gerekli tüm verileri tutar
-struct LoginState {
-    username: String,
-    password: String,
-    status: LoginStatus,
-    result_handle: Arc<Mutex<Option<Result<String, String>>>>,
-}
-
-// Sunucudan gelen JSON yanıtları için struct'lar
-// Structs VersionsResponse, Versions, ServerResponse removed as they were only used in removed login logic
 
 
 impl GrenadeSettingsTarget {
@@ -180,8 +160,6 @@ enum GrenadeHelperTransferState {
 }
 
 pub struct SettingsUI {
-    ui_state: UiState,
-    login_state: LoginState,
 
     discord_link_copied: Option<Instant>,
 
@@ -198,107 +176,124 @@ pub struct SettingsUI {
     grenade_helper_pending_target: Option<GrenadeSettingsTarget>,
     grenade_helper_pending_selected_id: Option<usize>,
 
-    ws_tx: Option<Sender<WsCommand>>,
+    player_search: String,
+
 }
 
-// =================================================================
-// YARDIMCI FONKSİYONLAR (HWID & LOGIN MANTIĞI)
-// =================================================================
+struct MatchPlayer {
+    entity_index: u32,
+    name: String,
+    team_id: u8,
+    health: i32,
+    alive: bool,
+}
 
-// get_hwid retained but logic simplifies usage in render
-fn get_hwid() -> Result<String, String> {
-    use std::{ffi::c_void, ptr};
-    use windows_sys::Win32::{
-        Foundation::{LocalFree, PSID},
-        Security::GetFileSecurityW,
-        Security::GetSecurityDescriptorOwner,
-        Security::OWNER_SECURITY_INFORMATION,
-        Security::Authorization::ConvertSidToStringSidW,
-    };
-    use widestring::U16CStr;
-
-    unsafe {
-        let path: Vec<u16> = ".".encode_utf16().chain(std::iter::once(0)).collect();
-        let mut bytes_needed = 0;
-
-        GetFileSecurityW(
-            path.as_ptr(),
-            OWNER_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            0,
-            &mut bytes_needed,
-        );
-
-        if bytes_needed == 0 {
-            return Err("HWID Error: Could not get required buffer size.".to_string());
-        }
-
-        let layout = std::alloc::Layout::from_size_align(bytes_needed as usize, 1).unwrap();
-        let p_security_descriptor = std::alloc::alloc(layout) as *mut c_void;
-
-        if GetFileSecurityW(
-            path.as_ptr(),
-            OWNER_SECURITY_INFORMATION,
-            p_security_descriptor,
-            bytes_needed,
-            &mut bytes_needed,
-        ) == 0
-        {
-            std::alloc::dealloc(p_security_descriptor as *mut u8, layout);
-            return Err("HWID Error: GetFileSecurityW failed.".to_string());
-        }
-
-        let mut p_sid_owner: PSID = ptr::null_mut();
-        let mut p_defaulted: i32 = 0;
-        if GetSecurityDescriptorOwner(
-            p_security_descriptor,
-            &mut p_sid_owner,
-            &mut p_defaulted,
-        ) == 0
-        {
-            std::alloc::dealloc(p_security_descriptor as *mut u8, layout);
-            return Err("HWID Error: GetSecurityDescriptorOwner failed.".to_string());
-        }
-
-        let mut sid_string_ptr: *mut u16 = ptr::null_mut();
-        if ConvertSidToStringSidW(p_sid_owner, &mut sid_string_ptr) == 0 {
-            std::alloc::dealloc(p_security_descriptor as *mut u8, layout);
-            return Err("HWID Error: ConvertSidToStringSidW failed.".to_string());
-        }
-
-        let sid_string = U16CStr::from_ptr_str(sid_string_ptr)
-            .to_string_lossy();
-
-        LocalFree(sid_string_ptr as *mut c_void);
-        std::alloc::dealloc(p_security_descriptor as *mut u8, layout);
-
-        Ok(sid_string)
+fn team_label(team_id: u8) -> &'static str {
+    match team_id {
+        2 => "T",
+        3 => "CT",
+        _ => "?",
     }
 }
 
-
-/// Windows dışı platformlar için yedek HWID fonksiyonu.
-#[cfg(not(windows))]
-fn get_hwid() -> Result<String, String> {
-    Ok("non-windows-hwid".to_string())
+fn set_match_feature(disabled: &mut BTreeSet<String>, players: &[MatchPlayer], enabled: bool) {
+    for player in players {
+        if enabled {
+            disabled.remove(&player.name);
+        } else {
+            disabled.insert(player.name.clone());
+        }
+    }
 }
 
+fn set_player_feature(disabled: &mut BTreeSet<String>, name: &str, enabled: bool) {
+    if enabled {
+        disabled.remove(name);
+    } else {
+        disabled.insert(name.to_string());
+    }
+}
 
-// legacy perform_full_login_check removed
+fn collect_match_players(states: &StateRegistry) -> Vec<MatchPlayer> {
+    let Ok(entities) = states.resolve::<StateEntityList>(()) else {
+        return Vec::new();
+    };
+    let Ok(class_name_cache) = states.resolve::<ClassNameCache>(()) else {
+        return Vec::new();
+    };
 
+    let local_pawn_index = states
+        .resolve::<StateLocalPlayerController>(())
+        .ok()
+        .and_then(|local_controller| {
+            let memory = states.resolve::<StateCS2Memory>(()).ok()?;
+            let controller = local_controller
+                .instance
+                .value_reference(memory.view_arc())?;
+            let pawn = controller.m_hPlayerPawn().ok()?;
+            pawn.is_valid().then_some(pawn.get_entity_index())
+        });
+
+    let mut players = Vec::new();
+    for entity_identity in entities.entities() {
+        let Ok(handle) = entity_identity.handle::<dyn cs2_schema_generated::cs2::client::C_CSPlayerPawn>() else {
+            continue;
+        };
+        if local_pawn_index == Some(handle.get_entity_index()) {
+            continue;
+        }
+
+        let Ok(class_info) = entity_identity.entity_class_info() else {
+            continue;
+        };
+        let Ok(entity_class) = class_name_cache.lookup(&class_info) else {
+            continue;
+        };
+        if !entity_class
+            .map(|name| *name == "C_CSPlayerPawn")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let alive = states
+            .resolve::<PlayerPawnState>(handle)
+            .map(|state| matches!(&*state, PlayerPawnState::Alive))
+            .unwrap_or(false);
+
+        let Ok(pawn_info) = states.resolve::<StatePawnInfo>(handle) else {
+            continue;
+        };
+        let Some(name) = pawn_info
+            .player_name
+            .clone()
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+
+        players.push(MatchPlayer {
+            entity_index: handle.get_entity_index(),
+            name,
+            team_id: pawn_info.team_id,
+            health: pawn_info.player_health,
+            alive,
+        });
+    }
+
+    players.sort_by(|a, b| {
+        a.team_id
+            .cmp(&b.team_id)
+            .then_with(|| a.name.cmp(&b.name))
+            .then(a.entity_index.cmp(&b.entity_index))
+    });
+    players
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 impl SettingsUI {
     pub fn new() -> Self {
         Self {
-            ui_state: UiState::Login,
-            login_state: LoginState {
-                username: String::with_capacity(64),
-                password: String::with_capacity(64),
-                status: LoginStatus::Idle,
-                result_handle: Arc::new(Mutex::new(None)),
-            },
-            
             discord_link_copied: None,
 
             esp_selected_target: EspSelector::None,
@@ -313,14 +308,11 @@ impl SettingsUI {
 
             grenade_helper_pending_target: None,
             grenade_helper_pending_selected_id: None,
-            ws_tx: None,
+
+            player_search: String::new(),
         }
     }
 
-    pub fn set_ws_context(&mut self, tx: Sender<WsCommand>, auth_handle: Arc<Mutex<Option<Result<String, String>>>>) {
-        self.ws_tx = Some(tx);
-        self.login_state.result_handle = auth_handle;
-    }
 
     pub fn render(
         &mut self,
@@ -328,87 +320,299 @@ impl SettingsUI {
         ui: &imgui::Ui,
         unicode_text: &UnicodeTextRenderer,
     ) {
-        match self.ui_state {
-            UiState::Login => self.render_login_screen(app, ui),
-            UiState::LoggedIn => self.render_main_ui(app, ui, unicode_text),
-        }
-    }
+        let content_font = ui.current_font().id();
+        let _title_font = if let Some(font_id) = app.fonts.valthrun.font_id() {
+            ui.push_font(font_id)
+        } else {
+            return;
+        };
 
-    /// Login ekranını çizen fonksiyon.
-    fn render_login_screen(&mut self, app: &Application, ui: &imgui::Ui) {
-        let display_size = ui.io().display_size;
-        let window_size = [400.0, 220.0];
-        let window_pos = [(display_size[0] - window_size[0]) * 0.5, (display_size[1] - window_size[1]) * 0.5];
-
-        ui.window(obfstr!("Login"))
-            .position(window_pos, Condition::Always)
-            .size(window_size, Condition::Always)
-            .resizable(false).collapsible(false).title_bar(true)
+        ui.window(obfstr!("Valthrun"))
+            .size([650.0, 300.0], Condition::FirstUseEver)
+            .size_constraints([650.0, 300.0], [2000.0, 2000.0])
+            .title_bar(false)
             .build(|| {
-                ui.text_wrapped("Please log in to continue.");
-                ui.separator();
-                ui.dummy([0.0, 10.0]);
-
-                let is_in_progress = matches!(self.login_state.status, LoginStatus::InProgress);
-                let _disable = ui.begin_disabled(is_in_progress);
-
-                ui.set_next_item_width(-1.0); // Tam genişlik
-                ui.input_text(obfstr!("Username"), &mut self.login_state.username).build();
-
-                ui.set_next_item_width(-1.0); // Tam genişlik
-                ui.input_text(obfstr!("Password"), &mut self.login_state.password).password(true).build();
-
-                ui.dummy([0.0, 10.0]);
-
-                if ui.button_with_size(obfstr!("Login"), [-1.0, 30.0]) {
-                    self.login_state.status = LoginStatus::InProgress;
-                    let username = self.login_state.username.clone();
-                    let password = self.login_state.password.clone();
-                    let result_handle = self.login_state.result_handle.clone();
-
-                    // Arka planda login işlemini yürüt
-                    // thread::spawn removed for WS
-                    if let Ok(hwid) = get_hwid() {
-                        if let Some(tx) = &self.ws_tx {
-                            let _ = tx.try_send(WsCommand::Login {
-                                username: username.clone(),
-                                password: password.clone(),
-                                hwid: hwid,
-                            });
-                        }
-                    } else {
-                         *self.login_state.result_handle.lock().unwrap() = Some(Err("Failed to get HWID".to_string()));
+                {
+                    for (text, color) in [
+                        ("V", [0.81, 0.69, 0.06, 1.0]),
+                        ("a", [0.84, 0.61, 0.15, 1.0]),
+                        ("l", [0.86, 0.52, 0.24, 1.0]),
+                        ("t", [0.89, 0.44, 0.33, 1.0]),
+                        ("h", [0.92, 0.36, 0.41, 1.0]),
+                        ("r", [0.95, 0.27, 0.50, 1.0]),
+                        ("u", [0.97, 0.19, 0.59, 1.0]),
+                        ("n", [1.00, 0.11, 0.68, 1.0]),
+                    ] {
+                        ui.text_colored(color, text);
+                        ui.same_line();
                     }
-                }
-                
-                drop(_disable);
 
-                // Arka plandan gelen sonucu kontrol et
-                if let Ok(mut result_lock) = self.login_state.result_handle.try_lock() {
-                    if let Some(result) = result_lock.take() {
-                        match result {
-                            Ok(_) => {
-                                self.ui_state = UiState::LoggedIn;
-                                let mut username_state = app.username_state.lock().unwrap();
-                                *username_state = Some(self.login_state.username.clone());
-                            },
-                            Err(e) => self.login_state.status = LoginStatus::Failed(e),
+                    ui.new_line();
+                    ui.dummy([0.0, 5.0]);
+                }
+
+                let _content_font = ui.push_font(content_font);
+                let mut settings = app.settings_mut();
+
+                if let Some(_tab_bar) = ui.tab_bar("main") {
+                    if let Some(_tab) = ui.tab_item("Information") {
+                        let build_info = app.app_state.resolve::<StateBuildInfo>(()).ok();
+
+                        ui.text(obfstr!("Valthrun an open source CS2 external read only kernel gameplay enhancer."));
+                        ui.text(&format!("{} Version {} ({})", obfstr!("Valthrun"), VERSION, env!("BUILD_TIME")));
+                        ui.text(&format!("{} Version {} ({})", obfstr!("CS2"), build_info.as_ref().map_or("error", |info| &info.revision), build_info.as_ref().map_or("error", |info| &info.build_datetime)));
+
+                        let ydummy = ui.window_size()[1] - ui.cursor_pos()[1] - ui.text_line_height_with_spacing() * 2.0 - 12.0;
+                        ui.dummy([0.0, ydummy]);
+                        ui.separator();
+
+                        ui.text(obfstr!("Join our discord:"));
+                        ui.text_colored([0.18, 0.51, 0.97, 1.0], obfstr!("https://discord.gg/ecKbpAPW5T"));
+                        if ui.is_item_hovered() {
+                            ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
+                        }
+
+                        if ui.is_item_clicked() {
+                            self.discord_link_copied = Some(Instant::now());
+                            ui.set_clipboard_text(obfstr!("https://discord.gg/ecKbpAPW5T"));
+                        }
+
+                        let show_copied = self.discord_link_copied.as_ref()
+                            .map(|time| time.elapsed().as_millis() < 3_000)
+                            .unwrap_or(false);
+
+                        if show_copied {
+                            ui.same_line();
+                            ui.text("(Copied)");
                         }
                     }
-                }
-                
-                // Durum mesajlarını göster
-                match &self.login_state.status {
-                    LoginStatus::InProgress => ui.text_colored([1.0, 0.76, 0.03, 1.0], "Logging in..."),
-                    LoginStatus::Failed(message) => ui.text_colored([1.0, 0.0, 0.0, 1.0], message),
-                    LoginStatus::Idle => {},
+
+                    if let Some(_) = ui.tab_item("Hotkeys") {
+                        ui.button_key_ignore_mouse_left(obfstr!("Toggle Settings"), &mut settings.key_settings, [150.0, 0.0]);
+
+                        {
+                            let _enabled = ui.begin_enabled(matches!(settings.esp_mode, KeyToggleMode::Toggle | KeyToggleMode::Trigger));
+                            ui.button_key_optional(obfstr!("ESP Toggle/Hold"), &mut settings.esp_toggle, [150.0, 0.0]);
+                        }
+                    }
+
+                    if let Some(_tab) = ui.tab_item(obfstr!("Visuals")) {
+                        ui.set_next_item_width(150.0);
+                        ui.combo_enum(obfstr!("ESP"), &[
+                            (KeyToggleMode::Off, "Off"),
+                            (KeyToggleMode::Trigger, "Hold"),
+                            (KeyToggleMode::TriggerInverted, "Hold Inverted"),
+                            (KeyToggleMode::Toggle, "Toggle"),
+                            (KeyToggleMode::AlwaysOn, "On"),
+                        ], &mut settings.esp_mode);
+
+                        ui.checkbox(obfstr!("Bomb Timer"), &mut settings.bomb_timer);
+                        ui.checkbox(obfstr!("Bomb Label"), &mut settings.bomb_label);
+                        ui.checkbox(obfstr!("Spectators List"), &mut settings.spectators_list);
+                        ui.checkbox(obfstr!("Grenade Helper"), &mut settings.grenade_helper.active);
+                        ui.checkbox(obfstr!("Sniper Crosshair"), &mut settings.sniper_crosshair);
+                    }
+
+                    if let Some(_tab) = ui.tab_item(obfstr!("ESP")) {
+                        if settings.esp_mode == KeyToggleMode::Off {
+                            let _style = ui.push_style_color(StyleColor::Text, [1.0, 0.76, 0.03, 1.0]);
+                            ui.text(obfstr!("ESP has been disabled."));
+                            ui.text(obfstr!("Please enable ESP under \"Visuals\" > \"ESP\""));
+                        } else {
+                            self.render_esp_settings(&mut *settings, ui);
+                        }
+                    }
+
+                    if let Some(_tab) = ui.tab_item(obfstr!("Grenade Helper")) {
+                        if settings.grenade_helper.active {
+                            self.render_grenade_helper(&app.app_state, &mut settings.grenade_helper, ui, unicode_text);
+                        } else {
+                            let _style = ui.push_style_color(StyleColor::Text, [1.0, 0.76, 0.03, 1.0]);
+                            ui.text(obfstr!("Grenade Helper has been disabled."));
+                            ui.text(obfstr!("Please enable the grenade helper under \"Visuals\" > \"Grenade Helper\""));
+                        }
+
+                        self.render_grenade_helper_transfer(&mut settings.grenade_helper, ui);
+                    }
+
+                    if let Some(_) = ui.tab_item(obfstr!("Aim Assist")) {
+                        let mut aim_assist_changed = false;
+                        ui.set_next_item_width(150.0);
+                        aim_assist_changed |= ui.combo_enum(obfstr!("Trigger Bot"), &[
+                            (KeyToggleMode::Off, "Off"),
+                            (KeyToggleMode::Trigger, "Hold"),
+                            (KeyToggleMode::TriggerInverted, "Hold Inverted"),
+                            (KeyToggleMode::Toggle, "Toggle"),
+                            (KeyToggleMode::AlwaysOn, "On"),
+                        ], &mut settings.trigger_bot_mode);
+
+                        if !matches!(settings.trigger_bot_mode, KeyToggleMode::Off | KeyToggleMode::AlwaysOn) {
+                            aim_assist_changed |= ui.button_key_optional(obfstr!("Trigger bot key"), &mut settings.key_trigger_bot, [150.0, 0.0]);
+                        }
+                        if !matches!(settings.trigger_bot_mode, KeyToggleMode::Off) {
+                            let mut values_updated = false;
+                            let slider_width = (ui.current_column_width() / 2.0 - 80.0).min(300.0).max(50.0);
+
+                            ui.text(obfstr!("Trigger delay min: "));
+                            ui.same_line();
+                            ui.set_next_item_width(slider_width);
+                            values_updated |= ui.slider_config("##delay_min", 0, 300).display_format("%dms").build(&mut settings.trigger_bot_delay_min);
+                            ui.same_line();
+
+                            ui.text(" max: ");
+                            ui.same_line();
+                            ui.set_next_item_width(slider_width);
+                            values_updated |= ui.slider_config("##delay_max", 0, 300).display_format("%dms").build(&mut settings.trigger_bot_delay_max);
+
+                            ui.text(obfstr!("Shoot duration: "));
+                            ui.same_line();
+                            match settings.trigger_bot_shot_preset {
+                                Some(index) => ui.text_colored(
+                                    [0.45, 0.95, 0.45, 1.0],
+                                    format!(
+                                        "Numpad {} ({}ms)",
+                                        index as usize + 1,
+                                        settings.trigger_bot_shot_duration
+                                    ),
+                                ),
+                                None => ui.text(format!("{}ms", settings.trigger_bot_shot_duration)),
+                            }
+                            ui.text_colored(
+                                [0.65, 0.65, 0.65, 1.0],
+                                obfstr!("Press numpad 1-9 to switch. NumLock must be on."),
+                            );
+
+                            let preset_slider_width = ((ui.current_column_width() - 3.0 * 56.0) / 3.0).clamp(70.0, 180.0);
+                            for index in 0..TRIGGER_SHOT_PRESET_COUNT {
+                                if index % 3 != 0 {
+                                    ui.same_line();
+                                }
+
+                                let selected = settings.trigger_bot_shot_preset == Some(index as u8);
+                                {
+                                    let _selected_colors = if selected {
+                                        Some((
+                                            ui.push_style_color(StyleColor::Button, [0.18, 0.50, 0.24, 1.0]),
+                                            ui.push_style_color(StyleColor::ButtonHovered, [0.22, 0.62, 0.30, 1.0]),
+                                            ui.push_style_color(StyleColor::ButtonActive, [0.14, 0.40, 0.18, 1.0]),
+                                        ))
+                                    } else {
+                                        None
+                                    };
+                                    if ui.small_button(format!(
+                                        "{}{}##shot_preset_btn_{}",
+                                        obfstr!("Num"),
+                                        index + 1,
+                                        index
+                                    )) {
+                                        settings.select_trigger_shot_preset(index);
+                                        aim_assist_changed = true;
+                                    }
+                                }
+                                ui.same_line();
+                                ui.set_next_item_width(preset_slider_width);
+                                let preset_edited = ui
+                                    .slider_config(format!("##shoot_preset_{}", index), 0, 1000)
+                                    .display_format("%dms")
+                                    .build(&mut settings.trigger_bot_shot_presets[index]);
+                                if preset_edited && selected {
+                                    settings.trigger_bot_shot_duration = settings.trigger_bot_shot_presets[index];
+                                }
+                                aim_assist_changed |= preset_edited;
+                            }
+
+                            if values_updated {
+                                /* fixup min/max */
+                                let delay_min = settings.trigger_bot_delay_min.min(settings.trigger_bot_delay_max);
+                                let delay_max = settings.trigger_bot_delay_min.max(settings.trigger_bot_delay_max);
+
+                                settings.trigger_bot_delay_min = delay_min;
+                                settings.trigger_bot_delay_max = delay_max;
+                            }
+                            aim_assist_changed |= values_updated;
+
+                            aim_assist_changed |= ui.checkbox(obfstr!("Retest trigger target after delay"), &mut settings.trigger_bot_check_target_after_delay);
+                            aim_assist_changed |= ui.checkbox(obfstr!("Team Check"), &mut settings.trigger_bot_team_check);
+                        }
+
+                        ui.separator();
+                        aim_assist_changed |= ui.checkbox(obfstr!("Enable Aimbot"), &mut settings.aim_bot_enabled);
+
+                        if settings.aim_bot_enabled {
+                            aim_assist_changed |= ui.button_key_optional(
+                                obfstr!("Aimbot key (hold)"),
+                                &mut settings.aim_bot_key,
+                                [150.0, 0.0],
+                            );
+
+                            ui.set_next_item_width(180.0);
+                            aim_assist_changed |= ui.combo_enum(
+                                obfstr!("Aim target"),
+                                &[
+                                    (AimTarget::Head, "Head"),
+                                    (AimTarget::Neck, "Neck"),
+                                    (AimTarget::Chest, "Chest"),
+                                    (AimTarget::MiddleBody, "Middle body"),
+                                ],
+                                &mut settings.aim_bot_target,
+                            );
+
+                            ui.set_next_item_width(180.0);
+                            aim_assist_changed |= ui.slider_config(obfstr!("FOV radius"), 10.0, 500.0)
+                                .display_format("%.0f px")
+                                .build(&mut settings.aim_bot_fov);
+
+                            ui.set_next_item_width(180.0);
+                            aim_assist_changed |= ui.slider_config(obfstr!("Smoothness"), 1.0, 100.0)
+                                .display_format("%.1f")
+                                .build(&mut settings.aim_bot_smooth);
+
+                            ui.set_next_item_width(180.0);
+                            aim_assist_changed |= ui.slider_config(obfstr!("Curve intensity"), 0.0, 2.0)
+                                .display_format("%.2f")
+                                .build(&mut settings.aim_bot_curve);
+
+                            aim_assist_changed |= ui.checkbox(obfstr!("Draw FOV"), &mut settings.aim_bot_draw_fov);
+                            aim_assist_changed |= ui.checkbox(obfstr!("Draw aim point"), &mut settings.aim_bot_draw_pointer);
+                        }
+
+                        ui.separator();
+                        aim_assist_changed |= ui.checkbox("Simple Recoil Helper", &mut settings.aim_assist_recoil);
+
+                        if aim_assist_changed {
+                            if let Err(error) = super::save_app_settings(&settings) {
+                                log::warn!("Failed to save Aim Assist settings: {}", error);
+                            }
+                        }
+                    }
+
+                    if let Some(_) = ui.tab_item(obfstr!("Players")) {
+                        self.render_players(&app.app_state, &mut settings, ui);
+                    }
+
+                    if let Some(_) = ui.tab_item("Web Radar") {
+                        ui.text(obfstr!("The Valthrun Web Radar has been moved into an own application which runs outside of the Valthrun CS2 overlay."));
+                        ui.text(obfstr!("More information on how to run the CS2 web radar can be found here:"));
+                        ui.text(obfstr!("https://wiki.valth.run/link/6"));
+                    }
+
+                    if let Some(_) = ui.tab_item("Misc") {
+                        ui.checkbox(obfstr!("Valthrun Watermark"), &mut settings.valthrun_watermark);
+
+                        if ui.checkbox(obfstr!("Hide overlay from screen capture"), &mut settings.hide_overlay_from_screen_capture) {
+                            app.settings_screen_capture_changed.store(true, Ordering::Relaxed);
+                        }
+
+                        if ui.checkbox(obfstr!("Show render debug overlay"), &mut settings.render_debug_window) {
+                            app.settings_render_debug_window_changed.store(true, Ordering::Relaxed);
+                        }
+                    }
                 }
             });
     }
-
     pub fn render_main_ui(
         &mut self,
-        app: &Application,
+        _app: &Application,
         ui: &imgui::Ui,
         _unicode_text: &UnicodeTextRenderer,
     ) {
@@ -424,7 +628,7 @@ impl SettingsUI {
             .build(|| {
                 ui.dummy([0.0, 10.0]);
 
-                let welcome_text = format!("Welcome, {}!", self.login_state.username);
+                let welcome_text = "Welcome!".to_string();
 
                 let text_width = ui.calc_text_size(&welcome_text)[0];
                 let window_width = ui.window_size()[0];
@@ -438,6 +642,118 @@ impl SettingsUI {
 
                 ui.text(welcome_text);
             });
+    }
+
+    fn render_players(
+        &mut self,
+        states: &StateRegistry,
+        settings: &mut AppSettings,
+        ui: &imgui::Ui,
+    ) {
+        ui.text_colored(
+            [0.65, 0.65, 0.65, 1.0],
+            obfstr!("ESP and Aim Assist are separate. Aim Assist covers aimbot and trigger bot."),
+        );
+
+        ui.set_next_item_width(240.0);
+        ui.input_text(obfstr!("Search##player_filter"), &mut self.player_search)
+            .hint(obfstr!("Player name"))
+            .build();
+
+        let players = collect_match_players(states);
+        let query = self.player_search.trim().to_lowercase();
+        let visible: Vec<&MatchPlayer> = if query.is_empty() {
+            players.iter().collect()
+        } else {
+            players
+                .iter()
+                .filter(|player| player.name.to_lowercase().contains(&query))
+                .collect()
+        };
+        let has_players = !players.is_empty();
+        let all_esp = has_players
+            && players
+                .iter()
+                .all(|player| settings.player_esp_enabled(Some(player.name.as_str())));
+        let all_aim = has_players
+            && players
+                .iter()
+                .all(|player| settings.player_aim_enabled(Some(player.name.as_str())));
+
+        let mut changed = false;
+        {
+            let _inputs = ui.begin_enabled(has_players);
+            let mut check_all = all_esp && all_aim;
+            if ui.checkbox(obfstr!("Check all"), &mut check_all) {
+                set_match_feature(&mut settings.esp_disabled_players, &players, check_all);
+                set_match_feature(&mut settings.aim_disabled_players, &players, check_all);
+                changed = true;
+            }
+            ui.same_line();
+            let mut check_esp = all_esp;
+            if ui.checkbox(obfstr!("ESP##master"), &mut check_esp) {
+                set_match_feature(&mut settings.esp_disabled_players, &players, check_esp);
+                changed = true;
+            }
+            ui.same_line();
+            let mut check_aim = all_aim;
+            if ui.checkbox(obfstr!("Aim Assist##master"), &mut check_aim) {
+                set_match_feature(&mut settings.aim_disabled_players, &players, check_aim);
+                changed = true;
+            }
+        }
+
+        ui.separator();
+        if !has_players {
+            ui.text(obfstr!("No players in the current match."));
+        } else if visible.is_empty() {
+            ui.text(obfstr!("No players match the search."));
+        } else {
+            for player in visible {
+                let detail = if player.alive && player.health > 0 {
+                    format!("{} HP", player.health)
+                } else {
+                    "dead".to_string()
+                };
+                ui.text(format!(
+                    "{}  {}  {}",
+                    player.name,
+                    team_label(player.team_id),
+                    detail
+                ));
+                ui.same_line();
+
+                let mut esp_enabled = settings.player_esp_enabled(Some(player.name.as_str()));
+                if ui.checkbox(format!("ESP##esp_{}", player.entity_index), &mut esp_enabled) {
+                    set_player_feature(
+                        &mut settings.esp_disabled_players,
+                        &player.name,
+                        esp_enabled,
+                    );
+                    changed = true;
+                }
+                ui.same_line();
+
+                let mut aim_enabled = settings.player_aim_enabled(Some(player.name.as_str()));
+                if ui.checkbox(
+                    format!("Aim Assist##aim_{}", player.entity_index),
+                    &mut aim_enabled,
+                ) {
+                    set_player_feature(
+                        &mut settings.aim_disabled_players,
+                        &player.name,
+                        aim_enabled,
+                    );
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            if let Err(error) = super::save_app_settings(settings) {
+                log::warn!("Failed to save player filters: {}", error);
+            }
+        }
     }
 
     fn render_esp_target(

@@ -1,6 +1,5 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::ffi::c_void;
-use anyhow::Context;
 use cs2::{
     CEntityIdentityEx, 
     CS2Model, ClassNameCache, MouseState, PlayerPawnState,
@@ -9,7 +8,6 @@ use cs2::{
 };
 use overlay::UnicodeTextRenderer;
 use nalgebra::Vector2;
-use cs2_schema_generated::cs2::client::CEntityInstance;
 
 
 use windows::{
@@ -19,11 +17,18 @@ use windows::{
         MapViewOfFile, OpenFileMappingW, FILE_MAP_READ, UnmapViewOfFile,
         MEMORY_MAPPED_VIEW_ADDRESS
     },
+    Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState,
+        VK_LBUTTON,
+    },
 };
 
 use super::Enhancement;
 use crate::{
-    settings::AppSettings,
+    settings::{
+        AimTarget,
+        AppSettings,
+    },
     view::ViewController,
 };
 
@@ -35,8 +40,10 @@ struct RecoilSharedMemory {
 
 pub struct HumanAimbot {
     start_time: Instant,
-    local_team_id: u8,
-    
+    fire_was_down: bool,
+    /// Aim moves pause across a click so the game sees the press and release.
+    fire_quiet_until: Instant,
+
     shm_handle: HANDLE,
     shm_ptr: *const RecoilSharedMemory,
 }
@@ -48,7 +55,8 @@ impl HumanAimbot {
     pub fn new() -> Self {
         let mut aimbot = Self {
             start_time: Instant::now(),
-            local_team_id: 0,
+            fire_was_down: false,
+            fire_quiet_until: Instant::now(),
             shm_handle: HANDLE(0), // Null handle
             shm_ptr: std::ptr::null(),
         };
@@ -111,7 +119,7 @@ impl HumanAimbot {
         let target_dx = diff_x + offset_x;
         let target_dy = diff_y + offset_y;
 
-        let smooth_factor = if speed > 85.0 { 85.0 } else { speed };
+        let smooth_factor = if speed > 100.0 { 100.0 } else { speed };
         let divisor = 100.0 - smooth_factor;
         
         let final_divisor = divisor / 5.0; 
@@ -132,6 +140,143 @@ impl HumanAimbot {
         };
 
         (move_x, move_y)
+    }
+
+    /// True when the FOV circle reaches the aim bone or any part of the player box.
+    fn inside_fov(
+        center: Vector2<f32>,
+        radius: f32,
+        bone: Vector2<f32>,
+        bounds_min: Vector2<f32>,
+        bounds_max: Vector2<f32>,
+    ) -> bool {
+        if (bone - center).norm() <= radius {
+            return true;
+        }
+
+        let closest = Vector2::new(
+            center.x.clamp(bounds_min.x, bounds_max.x),
+            center.y.clamp(bounds_min.y, bounds_max.y),
+        );
+        (closest - center).norm() <= radius
+    }
+}
+
+struct AimScreenTarget {
+    bone: mint::Vector2<f32>,
+    bounds_min: Vector2<f32>,
+    bounds_max: Vector2<f32>,
+}
+
+impl HumanAimbot {
+    /// Screen position of the selected aim bone for every enemy the aimbot can lock.
+    fn collect_aim_points(
+        &self,
+        states: &utils_state::StateRegistry,
+        settings: &AppSettings,
+        target: AimTarget,
+    ) -> anyhow::Result<Vec<AimScreenTarget>> {
+        let memory = states.resolve::<StateCS2Memory>(())?;
+        let view = states.resolve::<ViewController>(())?;
+        let entities = states.resolve::<StateEntityList>(())?;
+        let class_name_cache = states.resolve::<ClassNameCache>(())?;
+        let local_controller = states.resolve::<StateLocalPlayerController>(())?;
+
+        let Some(local_controller_ref) = local_controller.instance.value_reference(memory.view_arc()) else {
+            return Ok(Vec::new());
+        };
+
+        let local_team_id = local_controller_ref.m_iPendingTeamNum()?;
+
+        let mut points = Vec::new();
+        for entity_identity in entities.entities() {
+            let entity_class = class_name_cache.lookup(&entity_identity.entity_class_info()?)?;
+            if !entity_class.map(|name| *name == "C_CSPlayerPawn").unwrap_or(false) {
+                continue;
+            }
+
+            let pawn_state = states.resolve::<PlayerPawnState>(entity_identity.handle()?)?;
+            if *pawn_state != PlayerPawnState::Alive {
+                continue;
+            }
+
+            let pawn_info = states.resolve::<StatePawnInfo>(entity_identity.handle()?)?;
+            if !settings.player_aim_enabled(pawn_info.player_name.as_deref()) {
+                continue;
+            }
+            if pawn_info.team_id == local_team_id || pawn_info.player_health <= 0 {
+                continue;
+            }
+
+            let pawn_model = states.resolve::<StatePawnModelInfo>(entity_identity.handle()?)?;
+            let entry_model = states.resolve::<CS2Model>(pawn_model.model_address)?;
+            let hull_height = entry_model.vhull_max.z - entry_model.vhull_min.z;
+            let fallback_position = pawn_info.position
+                + nalgebra::Vector3::new(
+                    0.0,
+                    0.0,
+                    entry_model.vhull_min.z + hull_height * target.body_height_factor(),
+                );
+
+            let bone_position = target.bone_names().iter().find_map(|bone_name| {
+                let bone_index = entry_model
+                    .bones
+                    .iter()
+                    .position(|bone| bone.name == *bone_name)?;
+                let bone_position = pawn_model.bone_states.get(bone_index)?.position;
+                let distance = (bone_position - pawn_info.position).norm();
+                (8.0..=90.0).contains(&distance).then_some(bone_position)
+            });
+            let aim_position = bone_position.unwrap_or(fallback_position);
+
+            if let Some(screen_pos) = view.world_to_screen(&aim_position, true) {
+                let bone = Vector2::new(screen_pos.x, screen_pos.y);
+                let (mut bounds_min, mut bounds_max) = view
+                    .calculate_box_2d(
+                        &(entry_model.vhull_min + pawn_info.position),
+                        &(entry_model.vhull_max + pawn_info.position),
+                    )
+                    .unwrap_or((bone, bone));
+                bounds_min.x = bounds_min.x.min(bone.x);
+                bounds_min.y = bounds_min.y.min(bone.y);
+                bounds_max.x = bounds_max.x.max(bone.x);
+                bounds_max.y = bounds_max.y.max(bone.y);
+                points.push(AimScreenTarget {
+                    bone: screen_pos,
+                    bounds_min,
+                    bounds_max,
+                });
+            }
+        }
+
+        Ok(points)
+    }
+
+    fn draw_aim_pointer(draw_list: &imgui::DrawListMut, pos: mint::Vector2<f32>) {
+        let outline = [0.0, 0.0, 0.0, 0.85];
+        let color = [1.0, 0.2, 0.2, 1.0];
+        let arm = 8.0;
+
+        draw_list
+            .add_line([pos.x - arm, pos.y], [pos.x + arm, pos.y], outline)
+            .thickness(3.0)
+            .build();
+        draw_list
+            .add_line([pos.x, pos.y - arm], [pos.x, pos.y + arm], outline)
+            .thickness(3.0)
+            .build();
+        draw_list
+            .add_line([pos.x - arm, pos.y], [pos.x + arm, pos.y], color)
+            .thickness(1.5)
+            .build();
+        draw_list
+            .add_line([pos.x, pos.y - arm], [pos.x, pos.y + arm], color)
+            .thickness(1.5)
+            .build();
+        draw_list
+            .add_circle([pos.x, pos.y], 2.0, color)
+            .filled(true)
+            .build();
     }
 }
 
@@ -176,91 +321,60 @@ impl Enhancement for HumanAimbot {
         //     self.connect_shared_memory();
         //}
 
-        let memory = ctx.states.resolve::<StateCS2Memory>(())?;
         let view = ctx.states.resolve::<ViewController>(())?;
-        let entities = ctx.states.resolve::<StateEntityList>(())?;
-        let class_name_cache = ctx.states.resolve::<ClassNameCache>(())?;
-        
-        let local_controller = ctx.states.resolve::<StateLocalPlayerController>(())?;
-        
-        let local_controller_ref = match local_controller.instance.value_reference(memory.view_arc()) {
-            Some(lc) => lc,
-            None => return Ok(()),
-        };
-        
-        self.local_team_id = local_controller_ref.m_iPendingTeamNum()?;
-
-        let local_player_index = local_controller_ref
-            .m_pEntity()?
-            .value_reference(memory.view_arc())
-            .context("m_pEntity nullptr")?
-            .handle::<()>()?
-            .get_entity_index();
-
         let screen_center = Vector2::new(view.screen_bounds.x / 2.0, view.screen_bounds.y / 2.0);
-        
+
         let mut best_target_pos: Option<Vector2<f32>> = None;
-        let mut min_dist = settings.aim_bot_fov;
+        let mut min_dist = f32::MAX;
 
-        for entity_identity in entities.entities() {
-            let entity_class = class_name_cache.lookup(&entity_identity.entity_class_info()?)?;
-            if !entity_class.map(|name| *name == "C_CSPlayerPawn").unwrap_or(false) {
+        for target in self.collect_aim_points(ctx.states, &settings, settings.aim_bot_target)? {
+            let bone = Vector2::new(target.bone.x, target.bone.y);
+            if !Self::inside_fov(
+                screen_center,
+                settings.aim_bot_fov,
+                bone,
+                target.bounds_min,
+                target.bounds_max,
+            ) {
                 continue;
             }
 
-            let pawn_state = ctx.states.resolve::<PlayerPawnState>(entity_identity.handle()?)?;
-            if *pawn_state != PlayerPawnState::Alive {
-                continue;
-            }
-
-            let pawn_info = ctx.states.resolve::<StatePawnInfo>(entity_identity.handle()?)?;
-            
-            if pawn_info.team_id == self.local_team_id {
-                continue;
-            }
-
-            if pawn_info.player_health <= 0 {
-                continue;
-            }
-
-            if (pawn_info.spotted_by_mask & (1 << (local_player_index - 1))) == 0 {
-                 continue;
-            }
-
-            let pawn_model = ctx.states.resolve::<StatePawnModelInfo>(entity_identity.handle()?)?;
-            let entry_model = ctx.states.resolve::<CS2Model>(pawn_model.model_address)?;
-
-            if let Some(head_bone_index) = entry_model.bones.iter().position(|bone| bone.name == "head_0") {
-                 if let Some(head_state) = pawn_model.bone_states.get(head_bone_index) {
-                    if let Some(screen_pos_mint) = view.world_to_screen(&head_state.position, true) {
-                        
-                        let mut final_x = screen_pos_mint.x;
-                        let mut final_y = screen_pos_mint.y;
-
-                        // Recoil Ekleme
-                        if !self.shm_ptr.is_null() {
-                            unsafe {
-                                let recoil_data = &*self.shm_ptr;
-                                final_y += (recoil_data.recoil_offset_y as f32) * 0.75;
-                                final_x += (recoil_data.recoil_offset_x as f32) * 0.75;
-                            }
-                        }
-
-                        let screen_pos = Vector2::new(final_x, final_y);
-                        let dist = (screen_pos - screen_center).norm();
-
-                        if dist < min_dist {
-                            min_dist = dist;
-                            best_target_pos = Some(screen_pos);
-                        }
-                    }
-                 }
+            let dist = (bone - screen_center).norm();
+            if dist < min_dist {
+                min_dist = dist;
+                best_target_pos = Some(bone);
             }
         }
 
         if let Some(target_pos) = best_target_pos {
-            let diff_x = target_pos.x - screen_center.x;
-            let diff_y = target_pos.y - screen_center.y;
+            let mut aim_x = target_pos.x;
+            let mut aim_y = target_pos.y;
+
+            // Recoil shifts where we pull the crosshair, not whether the target is inside the FOV.
+            if !self.shm_ptr.is_null() {
+                unsafe {
+                    let recoil_data = &*self.shm_ptr;
+                    aim_y += (recoil_data.recoil_offset_y as f32) * 0.75;
+                    aim_x += (recoil_data.recoil_offset_x as f32) * 0.75;
+                }
+            }
+
+            let diff_x = aim_x - screen_center.x;
+            let diff_y = aim_y - screen_center.y;
+
+            // Already on the bone. Extra 1px moves every frame block later clicks.
+            if diff_x.hypot(diff_y) <= 2.5 {
+                return Ok(());
+            }
+
+            let fire_down = unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16) & 0x8000 != 0 };
+            if fire_down != self.fire_was_down {
+                self.fire_was_down = fire_down;
+                self.fire_quiet_until = Instant::now() + Duration::from_millis(70);
+            }
+            if Instant::now() < self.fire_quiet_until {
+                return Ok(());
+            }
 
             let (move_x, move_y) = self.calculate_curved_move(
                 diff_x, 
@@ -288,12 +402,25 @@ impl Enhancement for HumanAimbot {
         _unicode_text: &UnicodeTextRenderer,
     ) -> anyhow::Result<()> {
         let settings = states.resolve::<AppSettings>(())?;
+        if !settings.aim_bot_enabled {
+            return Ok(());
+        }
 
-        if settings.aim_bot_enabled && settings.aim_bot_draw_fov {
-            let draw_list = ui.get_background_draw_list();
-            let display_size = ui.io().display_size;
+        let draw_list = ui.get_background_draw_list();
+        let display_size = ui.io().display_size;
+
+        if settings.aim_bot_draw_pointer {
+            for target in self.collect_aim_points(states, &settings, settings.aim_bot_target)? {
+                let pos = target.bone;
+                if pos.x < 0.0 || pos.y < 0.0 || pos.x > display_size[0] || pos.y > display_size[1] {
+                    continue;
+                }
+                Self::draw_aim_pointer(&draw_list, pos);
+            }
+        }
+
+        if settings.aim_bot_draw_fov {
             let center = [display_size[0] / 2.0, display_size[1] / 2.0];
-
             draw_list
                 .add_circle(center, settings.aim_bot_fov, [1.0, 1.0, 1.0, 1.0])
                 .build();

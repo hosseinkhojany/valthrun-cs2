@@ -1,13 +1,8 @@
 use std::time::{Duration, Instant};
-use anyhow::Context;
 use imgui::{ImColor32, Ui};
 
 use cs2::{StateCS2Memory, StateLocalPlayerController};
 
-use cs2_schema_generated::cs2::client::{
-    CCSPlayerController, 
-    CCSPlayerController_ActionTrackingServices
-};
 
 use super::Enhancement;
 use crate::settings::{AppSettings, HitMarkerType};

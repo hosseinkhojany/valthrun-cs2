@@ -12,12 +12,12 @@ use radar_shared::{
 };
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
-    time::{self, Interval},
+    time,
 };
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 
-const RADAR_SERVER_URL: &str = "wss://yeageth.com/radar/publish";
+const RADAR_SERVER_URL: &str = "wss://radar.valth.run/publish";
 
 /// Commands that can be sent to the radar publisher
 #[derive(Debug)]
@@ -247,7 +247,7 @@ pub async fn run_radar_publisher(
                 session_auth_token = None;
                 continue;
             }
-            other => {
+            _ => {
                 error!("Unexpected session response received");
                 continue;
             }

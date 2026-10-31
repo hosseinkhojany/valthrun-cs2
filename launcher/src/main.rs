@@ -288,7 +288,7 @@ impl eframe::App for LauncherApp {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("YEAGETH")
+                                egui::RichText::new("VALTHRUN")
                                     .font(FontId::proportional(14.0))
                                     .strong()
                                     .color(Color32::WHITE),
@@ -535,7 +535,7 @@ fn load_window_icon() -> Option<egui::IconData> {
 
 fn main() -> Result<(), eframe::Error> {
     let config = LauncherConfig {
-        base_url: "https://yeageth.com/stream_files/csesp".to_string(),
+        base_url: "https://valth.run/stream_files/csesp".to_string(),
         install_dir: PathBuf::from("./app"),
         manifest_file: "manifest.json".to_string(),
         signature_file: Some("manifest.json.sig".to_string()),
@@ -551,7 +551,7 @@ fn main() -> Result<(), eframe::Error> {
         .with_resizable(false)
         .with_decorations(false)
         .with_transparent(true)
-        .with_title("Yeageth Stream Loader");
+        .with_title("Valthrun Stream Loader");
 
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(icon);
@@ -564,7 +564,7 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "Yeageth Stream Loader",
+        "Valthrun Stream Loader",
         options,
         Box::new(|cc| Ok(Box::new(LauncherApp::new(cc, config)))),
     )
