@@ -574,6 +574,7 @@ impl SettingsUI {
 
                             aim_assist_changed |= ui.checkbox(obfstr!("Draw FOV"), &mut settings.aim_bot_draw_fov);
                             aim_assist_changed |= ui.checkbox(obfstr!("Draw aim point"), &mut settings.aim_bot_draw_pointer);
+                            aim_assist_changed |= ui.checkbox(obfstr!("Aim through walls"), &mut settings.aim_bot_through_walls);
                         }
 
                         ui.separator();

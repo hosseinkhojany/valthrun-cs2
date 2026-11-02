@@ -408,6 +408,9 @@ pub struct AppSettings {
     #[serde(default = "bool_true")]
     pub aim_bot_draw_pointer: bool,
 
+    #[serde(default = "bool_false")]
+    pub aim_bot_through_walls: bool,
+
     #[serde(default = "default_key_aimbot")]
     pub aim_bot_key: Option<HotKey>,
 

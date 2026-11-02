@@ -8,6 +8,7 @@ use cs2::{
 };
 use overlay::UnicodeTextRenderer;
 use nalgebra::Vector2;
+use cs2_schema_generated::cs2::client::CEntityInstance;
 
 
 use windows::{
@@ -187,6 +188,12 @@ impl HumanAimbot {
         };
 
         let local_team_id = local_controller_ref.m_iPendingTeamNum()?;
+        let local_slot = local_controller_ref
+            .m_pEntity()?
+            .value_reference(memory.view_arc())
+            .and_then(|entity| entity.handle::<()>().ok())
+            .map(|handle| handle.get_entity_index())
+            .filter(|index| (1..=64).contains(index));
 
         let mut points = Vec::new();
         for entity_identity in entities.entities() {
@@ -206,6 +213,16 @@ impl HumanAimbot {
             }
             if pawn_info.team_id == local_team_id || pawn_info.player_health <= 0 {
                 continue;
+            }
+
+            if !settings.aim_bot_through_walls {
+                // Spotted mask bit is the local player slot. Unset means a wall is blocking them.
+                let visible = local_slot
+                    .map(|slot| pawn_info.spotted_by_mask & (1u64 << (slot - 1)) != 0)
+                    .unwrap_or(false);
+                if !visible {
+                    continue;
+                }
             }
 
             let pawn_model = states.resolve::<StatePawnModelInfo>(entity_identity.handle()?)?;
